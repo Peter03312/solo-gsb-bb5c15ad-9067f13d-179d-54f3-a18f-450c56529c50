@@ -8,6 +8,10 @@ const multer = require('multer');
 const { get } = require('./db');
 const { ApiError, isInt, validateTimeline } = require('./validation');
 const { buildSrt, parseSrt } = require('./srt');
+const {
+  SOURCE_TRACK, TRANSLATION_TRACK,
+  mapRule, mapWaiver, waiverMatches, runQc,
+} = require('./qc');
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'data', 'videos');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -89,9 +93,376 @@ function mapPublication(row) {
     segment_count: row.segment_count,
     has_translation: row.translation_snapshot != null,
     translation_lang: row.translation_lang != null ? row.translation_lang : null,
+    has_qc: row.qc_snapshot != null,
     published_at: row.published_at,
   };
 }
+
+/* ---------------- 质检规则与放行 ---------------- */
+
+const QC_TRACKS = [SOURCE_TRACK, TRANSLATION_TRACK];
+
+function listQcRules(videoId) {
+  return get().prepare('SELECT * FROM qc_rules WHERE video_id = ?').all(videoId);
+}
+
+function listQcWaivers(videoId) {
+  return get().prepare('SELECT * FROM qc_waivers WHERE video_id = ? ORDER BY id DESC').all(videoId);
+}
+
+// 对当前草稿执行质检；译文轨未启用时只检查原文规则
+function evaluateQc(video, segments, translations) {
+  return runQc(video, segments, translations, listQcRules(video.id), listQcWaivers(video.id));
+}
+
+// 读取并校验阈值：缺失键=不配置（null）；显式 null=取消该阈值；非法值 422
+function readThreshold(body, key, { integer }) {
+  if (!(key in body)) return undefined; // 未提供：保持不变（PUT 语义下逐键更新）
+  const value = body[key];
+  if (value === null) return null;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new ApiError(422, 'invalid_qc_threshold',
+      `质检阈值 ${key} 必须为正数（${integer ? '正整数' : '正数，可小数'}），或 null 取消配置`);
+  }
+  if (value <= 0) {
+    throw new ApiError(422, 'invalid_qc_threshold', `质检阈值 ${key} 必须为正数（收到 ${value}）`);
+  }
+  if (integer && !Number.isInteger(value)) {
+    throw new ApiError(422, 'invalid_qc_threshold', `质检阈值 ${key}（最大单行字符数）必须为正整数`);
+  }
+  if (value > 1000000) {
+    throw new ApiError(422, 'invalid_qc_threshold', `质检阈值 ${key} 过大（上限 1000000）`);
+  }
+  return value;
+}
+
+// 计算每条历史放行当前是否仍有效（绑定的时间/文本/语言/阈值任一变化即失效）
+function waiversWithState(video, segments, translations, rules, waiverRows) {
+  const current = runQc(video, segments, translations, rules, []);
+  const byKey = new Map();
+  for (const v of current.violations) {
+    byKey.set(`${v.track}|${v.kind}|${v.segment_id}`, v);
+  }
+  return waiverRows.map((w) => {
+    const base = mapWaiver(w);
+    const live = byKey.get(`${w.track}|${w.kind}|${w.segment_id}`);
+    const valid = !!(live && waiverMatches(w, live));
+    let invalid_reason = null;
+    if (!valid) {
+      const seg = segments.find((s) => s.id === w.segment_id);
+      if (!seg) invalid_reason = '片段已删除';
+      else if (w.track === 'translation' && !video.translation_lang) invalid_reason = '译文轨道已停用';
+      else if (w.track === 'translation' && video.translation_lang !== w.language) invalid_reason = '译文轨道语言已变化';
+      else if (seg.start_ms !== w.bound_start_ms || seg.end_ms !== w.bound_end_ms) invalid_reason = '片段时间已变化';
+      else {
+        const text = w.track === 'source'
+          ? seg.text
+          : (translations.find((t) => t.segment_id === seg.id) || {}).text;
+        if (text == null) invalid_reason = w.track === 'translation' ? '译文已被删除' : '文本已变化';
+        else if (text !== w.bound_text) invalid_reason = '文本已变化';
+        else {
+          const rule = rules.find((r) => r.track === w.track);
+          const curThreshold = w.kind === 'cps' ? rule && rule.max_cps : rule && rule.max_line_chars;
+          const boundThreshold = w.kind === 'cps' ? w.bound_max_cps : w.bound_max_line_chars;
+          if (!rule || curThreshold == null) invalid_reason = '该阈值规则已取消';
+          else if (Number(curThreshold) !== Number(boundThreshold)) invalid_reason = '阈值已变化';
+          else invalid_reason = '违规已不存在';
+        }
+      }
+    }
+    return { ...base, valid, invalid_reason };
+  });
+}
+
+// 查看质检规则（原文 + 已启用译文轨；未配置的轨道返回 null）
+router.get('/videos/:id(\\d+)/qc/rules', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const rows = listQcRules(video.id);
+    res.json({
+      source: mapRule(rows.find((r) => r.track === SOURCE_TRACK)) || null,
+      translation: mapRule(rows.find((r) => r.track === TRANSLATION_TRACK)) || null,
+      translation_enabled: video.translation_lang != null,
+      translation_lang: video.translation_lang != null ? video.translation_lang : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 配置（新增/修改）某条轨道的质检阈值：{track, max_cps?, max_line_chars?, revision?}
+// 首次配置无需 revision；之后每次修改须携带所见 revision，过期返回 409 与当前规则。
+router.put('/videos/:id(\\d+)/qc/rules', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const track = req.body && req.body.track;
+    if (!QC_TRACKS.includes(track)) {
+      throw new ApiError(422, 'invalid_qc_track', '请指定 track：source（原文）或 translation（译文）');
+    }
+    if (track === TRANSLATION_TRACK && !video.translation_lang) {
+      throw new ApiError(422, 'no_translation_track',
+        '该视频尚未启用译文轨道：请先启用译文轨道，再配置译文质检阈值；未启用时只检查原文');
+    }
+    const hasKeys = req.body && ('max_cps' in req.body || 'max_line_chars' in req.body);
+    if (!hasKeys) {
+      throw new ApiError(422, 'missing_qc_threshold',
+        '请至少提供 max_cps（最大每秒字符数，正数）或 max_line_chars（最大单行字符数，正整数）；显式传 null 可取消该项');
+    }
+    const maxCpsReq = readThreshold(req.body, 'max_cps', { integer: false });
+    const maxLineReq = readThreshold(req.body, 'max_line_chars', { integer: true });
+
+    const result = get().transaction(() => {
+      const locked = get().prepare('SELECT * FROM videos WHERE id = ?').get(video.id);
+      if (!locked) throw new ApiError(404, 'not_found', `视频 #${video.id} 不存在`);
+      if (track === TRANSLATION_TRACK && !locked.translation_lang) {
+        throw new ApiError(422, 'no_translation_track', '译文轨道已被停用，无法配置译文质检规则');
+      }
+      const existing = get()
+        .prepare('SELECT * FROM qc_rules WHERE video_id = ? AND track = ?')
+        .get(video.id, track);
+      if (existing) {
+        const expected = Number(req.body.revision);
+        if (!Number.isInteger(expected) || expected < 1) {
+          throw new ApiError(422, 'missing_revision',
+            '该质检规则已存在，请携带所见规则修订号 revision（正整数）');
+        }
+        if (existing.revision !== expected) {
+          throw new ApiError(409, 'revision_conflict',
+            '质检规则修订号已过期：规则已被他人修改，已返回当前规则，请基于当前阈值重试',
+            { current: mapRule(existing) });
+        }
+      } else if (req.body.revision != null) {
+        throw new ApiError(422, 'unexpected_revision', '该轨道尚无质检规则，首次配置请不要携带 revision');
+      }
+
+      const nextCps = maxCpsReq === undefined ? (existing ? existing.max_cps : null) : maxCpsReq;
+      const nextLine = maxLineReq === undefined ? (existing ? existing.max_line_chars : null) : maxLineReq;
+      if (nextCps == null && nextLine == null) {
+        throw new ApiError(422, 'missing_qc_threshold', '两项阈值均为空：请至少配置一项（正数），或使用 DELETE 删除规则');
+      }
+      const language = track === TRANSLATION_TRACK ? locked.translation_lang : null;
+      const ts = now();
+      if (existing) {
+        const unchanged =
+          (existing.max_cps == null ? null : existing.max_cps) === (nextCps == null ? null : nextCps) &&
+          (existing.max_line_chars == null ? null : existing.max_line_chars) === (nextLine == null ? null : nextLine) &&
+          existing.language === language;
+        get()
+          .prepare('UPDATE qc_rules SET max_cps = ?, max_line_chars = ?, language = ?, revision = revision + 1, updated_at = ? WHERE id = ?')
+          .run(nextCps, nextLine, language, ts, existing.id);
+        return {
+          statusCode: 200,
+          rule: mapRule(get().prepare('SELECT * FROM qc_rules WHERE id = ?').get(existing.id)),
+          unchanged,
+        };
+      }
+      const info = get()
+        .prepare(
+          `INSERT INTO qc_rules (video_id, track, language, max_cps, max_line_chars, revision, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
+        )
+        .run(video.id, track, language, nextCps, nextLine, ts, ts);
+      return { statusCode: 201, rule: mapRule(get().prepare('SELECT * FROM qc_rules WHERE id = ?').get(info.lastInsertRowid)), unchanged: false };
+    })();
+
+    res.status(result.statusCode).json({ ok: true, rule: result.rule, unchanged: result.unchanged });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 删除某条轨道的全部质检阈值配置（历史放行保留；未配置阈值的轨道本就不增加阻断）
+router.delete('/videos/:id(\\d+)/qc/rules/:track(source|translation)', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const track = req.params.track;
+    const result = get().transaction(() => {
+      const existing = get()
+        .prepare('SELECT * FROM qc_rules WHERE video_id = ? AND track = ?')
+        .get(video.id, track);
+      if (!existing) return { deleted: false, revision: null };
+      const expected = req.body && req.body.revision != null ? Number(req.body.revision) : NaN;
+      if (!Number.isInteger(expected) || expected < 1) {
+        throw new ApiError(422, 'missing_revision', '请在 JSON 请求体中携带所见规则修订号 revision（正整数）');
+      }
+      if (existing.revision !== expected) {
+        throw new ApiError(409, 'revision_conflict',
+          '质检规则修订号已过期：规则已被他人修改，已返回当前规则，请基于当前状态重试',
+          { current: mapRule(existing) });
+      }
+      get().prepare('DELETE FROM qc_rules WHERE id = ?').run(existing.id);
+      return { deleted: true, revision: existing.revision };
+    })();
+    if (!result.deleted) {
+      res.status(404).json({ error: { code: 'qc_rule_not_found', message: `视频 #${video.id} 尚未配置 ${track} 质检规则` } });
+      return;
+    }
+    res.json({ ok: true, track, deleted: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 查看当前草稿质检结果：逐段列出轨道、实测值、阈值与违规项（含放行状态）
+router.get('/videos/:id(\\d+)/qc', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const segments = listSegments(video.id);
+    const translations = video.translation_lang ? listTranslations(video.id) : [];
+    const qc = evaluateQc(video, segments, translations);
+    res.json({
+      duration_ms: video.duration_ms,
+      translation_lang: video.translation_lang != null ? video.translation_lang : null,
+      ...qc,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 放行历史：列出全部放行理由及其当前是否仍有效（失效后保留历史，不再阻断解除）
+router.get('/videos/:id(\\d+)/qc/waivers', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const segments = listSegments(video.id);
+    const translations = video.translation_lang ? listTranslations(video.id) : [];
+    const rules = listQcRules(video.id);
+    const rows = listQcWaivers(video.id);
+    const waivers = waiversWithState(video, segments, translations, rules, rows);
+    res.json({ waivers, valid_count: waivers.filter((w) => w.valid).length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 对单项违规填写理由放行：
+// {segment_id, track, kind, reason, rule_revision?}
+// 放行绑定片段时间、文本、轨道语言与当时阈值；当前不存在对应违规时拒绝。
+// 规则修订号过期（规则被并发修改）返回 409 与当前规则/质检状态。
+router.post('/videos/:id(\\d+)/qc/waivers', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const video = loadVideo(videoId);
+    const segmentId = Number(req.body && req.body.segment_id);
+    const track = req.body && req.body.track;
+    const kind = req.body && req.body.kind;
+    if (!Number.isInteger(segmentId) || segmentId < 1) {
+      throw new ApiError(422, 'invalid_segment_id', '请指定正整数片段 ID segment_id');
+    }
+    if (!QC_TRACKS.includes(track)) {
+      throw new ApiError(422, 'invalid_qc_track', '请指定 track：source（原文）或 translation（译文）');
+    }
+    if (!['cps', 'line_chars'].includes(kind)) {
+      throw new ApiError(422, 'invalid_qc_kind', '请指定违规项 kind：cps（每秒字符数）或 line_chars（单行字符数）');
+    }
+    const reason = typeof (req.body && req.body.reason) === 'string' ? req.body.reason.trim() : '';
+    if (!reason) throw new ApiError(422, 'invalid_reason', '请填写放行理由 reason（1–500 字）');
+    if (req.body.reason.length > 500) throw new ApiError(422, 'invalid_reason', '放行理由不能超过 500 字');
+    const createdBy = typeof (req.body && req.body.created_by) === 'string'
+      ? req.body.created_by.slice(0, 80)
+      : null;
+
+    const result = get().transaction(() => {
+      const locked = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+      if (!locked) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+      if (track === TRANSLATION_TRACK && !locked.translation_lang) {
+        throw new ApiError(422, 'no_translation_track', '译文轨道未启用，无法放行译文违规');
+      }
+      const rule = get()
+        .prepare('SELECT * FROM qc_rules WHERE video_id = ? AND track = ?')
+        .get(videoId, track);
+      if (!rule || (kind === 'cps' ? rule.max_cps == null : rule.max_line_chars == null)) {
+        throw new ApiError(422, 'qc_rule_missing', `该轨道当前没有配置${kind === 'cps' ? '每秒字符数' : '单行字符数'}阈值，无此项可放行`);
+      }
+      if (req.body.rule_revision != null) {
+        const rr = Number(req.body.rule_revision);
+        if (!Number.isInteger(rr) || rr < 1 || rr !== rule.revision) {
+          throw new ApiError(409, 'revision_conflict',
+            '质检规则修订号已过期：规则已被他人修改，请基于当前阈值重新质检后再放行',
+            { current_rule: mapRule(rule) });
+        }
+      }
+      const seg = get().prepare('SELECT * FROM segments WHERE id = ? AND video_id = ?').get(segmentId, videoId);
+      if (!seg) throw new ApiError(404, 'segment_not_found', `片段 #${segmentId} 不存在`);
+
+      let tr = null;
+      let text = seg.text;
+      if (track === TRANSLATION_TRACK) {
+        tr = get()
+          .prepare(`${TRANSLATION_JOIN} WHERE t.video_id = ? AND t.segment_id = ?`)
+          .get(videoId, segmentId);
+        if (!tr) throw new ApiError(422, 'translation_missing', `片段 #${segmentId} 尚无译文，不存在译文违规可放行`);
+        text = tr.text;
+      }
+
+      // 重新计算该片段该指标，确认违规当前确实存在
+      const qc = runQc(locked, [seg], tr ? [mapTranslationJoined(tr)] : [], [rule], []);
+      const violation = qc.violations.find((x) => x.track === track && x.kind === kind);
+      if (!violation) {
+        throw new ApiError(422, 'violation_not_found',
+          `片段 #${segmentId} 当前不存在${kind === 'cps' ? '每秒字符数' : '单行字符数'}违规（可能已被修正），无需放行`);
+      }
+
+      // 已存在仍然有效的相同放行 -> 幂等返回，不重复写历史
+      const existing = get()
+        .prepare(
+          `SELECT * FROM qc_waivers
+           WHERE video_id = ? AND segment_id = ? AND track = ? AND kind = ?
+           ORDER BY id DESC`
+        )
+        .all(videoId, segmentId, track, kind);
+      const live = existing.find((w) => waiverMatches(w, violation));
+      if (live) {
+        return { statusCode: 200, waiver: mapWaiver(live), already_exists: true };
+      }
+
+      const info = get()
+        .prepare(
+          `INSERT INTO qc_waivers
+             (video_id, segment_id, track, kind, language,
+              bound_start_ms, bound_end_ms, bound_text, bound_max_cps, bound_max_line_chars,
+              reason, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          videoId, segmentId, track, kind,
+          track === TRANSLATION_TRACK ? locked.translation_lang : null,
+          seg.start_ms, seg.end_ms, text,
+          kind === 'cps' ? rule.max_cps : null,
+          kind === 'line_chars' ? rule.max_line_chars : null,
+          reason, createdBy, now()
+        );
+      return {
+        statusCode: 201,
+        waiver: mapWaiver(get().prepare('SELECT * FROM qc_waivers WHERE id = ?').get(info.lastInsertRowid)),
+        already_exists: false,
+      };
+    })();
+
+    res.status(result.statusCode).json({ ok: true, waiver: result.waiver, already_exists: result.already_exists });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 查看已发布版本固定的规则、质检结果与有效放行；旧版本（无质检快照）明确返回 available=false
+router.get('/videos/:id(\\d+)/publications/:version(\\d+)/qc', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const version = Number(req.params.version);
+    const row = get()
+      .prepare('SELECT * FROM publications WHERE video_id = ? AND version = ?')
+      .get(video.id, version);
+    if (!row) throw new ApiError(404, 'version_not_found', `已发布版本 v${version} 不存在`);
+    if (row.qc_snapshot == null) {
+      res.json({ available: false, version, reason: '该版本发布于质检功能上线前，未固定质检信息' });
+      return;
+    }
+    res.json({ available: true, ...JSON.parse(row.qc_snapshot) });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /* ---------------- 译文轨道 ---------------- */
 
@@ -193,6 +564,8 @@ router.delete('/videos/:id(\\d+)/translation/track', (req, res, next) => {
     }
     get().transaction(() => {
       get().prepare('DELETE FROM translations WHERE video_id = ?').run(video.id);
+      // 译文质检规则随轨道停用一并移除（历史放行保留，但其译文放行随即失效）
+      get().prepare("DELETE FROM qc_rules WHERE video_id = ? AND track = 'translation'").run(video.id);
       get().prepare('UPDATE videos SET translation_lang = NULL WHERE id = ?').run(video.id);
     })();
     res.status(204).end();
@@ -344,11 +717,16 @@ router.post('/videos', upload.single('video'), (req, res, next) => {
 router.get('/videos/:id(\\d+)', (req, res, next) => {
   try {
     const video = loadVideo(req.params.id);
+    const ruleRows = listQcRules(video.id);
     res.json({
       video,
       segments: listSegments(video.id),
       translation_lang: video.translation_lang != null ? video.translation_lang : null,
       translations: video.translation_lang ? listTranslations(video.id) : [],
+      qc_rules: {
+        source: mapRule(ruleRows.find((r) => r.track === SOURCE_TRACK)) || null,
+        translation: mapRule(ruleRows.find((r) => r.track === TRANSLATION_TRACK)) || null,
+      },
       publications: get()
         .prepare('SELECT * FROM publications WHERE video_id = ? ORDER BY version DESC')
         .all(video.id)
@@ -584,7 +962,8 @@ router.delete('/videos/:id(\\d+)/segments/:sid(\\d+)', (req, res, next) => {
 
 // 发布门禁：原文全部已审且时间合法；启用译文轨道时还要求每段译文齐备、
 // 已审且对应当前原文内容（未失效）。pending 逐段列出待处理问题，供工作台定位。
-function publicationStatus(video, segments, translations) {
+// 另叠加质检门禁：已配置阈值的轨道存在「未放行」违规即不可发布。
+function publicationStatus(video, segments, translations, qc) {
   const problems = [];
   const pending = [];
   if (segments.length === 0) problems.push('至少需要一个字幕片段才能发布');
@@ -602,6 +981,12 @@ function publicationStatus(video, segments, translations) {
         if (tr.stale) reasons.push('translation_stale');
         if (!tr.reviewed) reasons.push('translation_unreviewed');
       }
+    }
+    if (qc) {
+      const qcReasons = qc.violations
+        .filter((x) => x.segment_id === s.id && !x.waived)
+        .map((x) => `qc_${x.track}_${x.kind}`);
+      reasons.push(...qcReasons);
     }
     if (reasons.length) {
       pending.push({ segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, reasons });
@@ -629,7 +1014,20 @@ function publicationStatus(video, segments, translations) {
     if (parts.length) problems.push(`译文轨道（${video.translation_lang}）：${parts.join('、')}`);
   }
 
-  return { canPublish: problems.length === 0, problems, pending, translation };
+  let quality = null;
+  if (qc) {
+    quality = {
+      checked_tracks: qc.checked_tracks,
+      violation_count: qc.violations.length,
+      unwaived_count: qc.unwaived_count,
+      waived_count: qc.waived_count,
+    };
+    if (qc.unwaived_count > 0) {
+      problems.push(`质检：${qc.unwaived_count} 项未放行违规（共 ${qc.violations.length} 项，已放行 ${qc.waived_count} 项），请修正或逐项填写理由放行`);
+    }
+  }
+
+  return { canPublish: problems.length === 0, problems, pending, translation, quality, qc };
 }
 
 router.get('/videos/:id(\\d+)/status', (req, res, next) => {
@@ -637,8 +1035,17 @@ router.get('/videos/:id(\\d+)/status', (req, res, next) => {
     const video = loadVideo(req.params.id);
     const segments = listSegments(video.id);
     const translations = video.translation_lang ? listTranslations(video.id) : [];
-    const status = publicationStatus(video, segments, translations);
-    res.json({ ...status, duration_ms: video.duration_ms });
+    const qc = evaluateQc(video, segments, translations);
+    const status = publicationStatus(video, segments, translations, qc);
+    res.json({
+      canPublish: status.canPublish,
+      problems: status.problems,
+      pending: status.pending,
+      translation: status.translation,
+      quality: status.quality,
+      qc,
+      duration_ms: video.duration_ms,
+    });
   } catch (err) {
     next(err);
   }
@@ -652,11 +1059,20 @@ router.post('/videos/:id(\\d+)/publish', (req, res, next) => {
       if (!locked) throw new ApiError(404, 'not_found', `视频 #${video.id} 不存在`);
       const segments = listSegments(video.id);
       const translations = locked.translation_lang ? listTranslations(video.id) : [];
-      const status = publicationStatus(locked, segments, translations);
+      // 发布时重新质检：未放行违规阻止发布并返回清单，不产生版本
+      const qc = runQc(locked, segments, translations,
+        get().prepare('SELECT * FROM qc_rules WHERE video_id = ?').all(video.id),
+        get().prepare('SELECT * FROM qc_waivers WHERE video_id = ?').all(video.id));
+      const status = publicationStatus(locked, segments, translations, qc);
       if (!status.canPublish) {
         // 不生成部分版本：事务在此抛出，无任何写入
         throw new ApiError(422, 'not_publishable', `当前草稿不能发布：${status.problems.join('；')}`,
-          { pending: status.pending, translation: status.translation });
+          {
+            pending: status.pending,
+            translation: status.translation,
+            quality: status.quality,
+            qc_violations: qc.violations,
+          });
       }
       const maxRow = get()
         .prepare('SELECT COALESCE(MAX(version), 0) AS v FROM publications WHERE video_id = ?')
@@ -673,12 +1089,27 @@ router.post('/videos/:id(\\d+)/publish', (req, res, next) => {
           segments.map((s) => ({ start_ms: s.start_ms, end_ms: s.end_ms, text: bySeg.get(s.id).text }))
         );
       }
+      // 固定发布时刻的规则、质检结果与有效放行（旧版本无此快照，查看/导出行为不变）
+      const qcSnapshot = JSON.stringify({
+        version,
+        translation_lang: locked.translation_lang != null ? locked.translation_lang : null,
+        rules: qc.rules,
+        generated_at: qc.generated_at,
+        violations: qc.violations,
+        unwaived_count: qc.unwaived_count,
+        waived_count: qc.waived_count,
+        valid_waivers: get()
+          .prepare('SELECT * FROM qc_waivers WHERE video_id = ? ORDER BY id')
+          .all(video.id)
+          .filter((w) => qc.violations.some((x) => x.waived && x.waiver.id === w.id))
+          .map(mapWaiver),
+      });
       const info = get()
         .prepare(
-          `INSERT INTO publications (video_id, version, snapshot, translation_snapshot, translation_lang, segment_count, published_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO publications (video_id, version, snapshot, translation_snapshot, translation_lang, qc_snapshot, segment_count, published_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         )
-        .run(video.id, version, snapshot, translationSnapshot, locked.translation_lang, segments.length, now());
+        .run(video.id, version, snapshot, translationSnapshot, locked.translation_lang, qcSnapshot, segments.length, now());
       return get().prepare('SELECT * FROM publications WHERE id = ?').get(info.lastInsertRowid);
     })();
     res.status(201).json({ publication: mapPublication(pub) });

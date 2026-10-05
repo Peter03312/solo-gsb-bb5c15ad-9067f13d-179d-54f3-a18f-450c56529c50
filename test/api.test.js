@@ -221,6 +221,7 @@ async function main() {
   await restoreTests();
   await translationTests();
   await shiftTests();
+  await qcTests();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
@@ -1069,6 +1070,272 @@ async function shiftTests() {
   check('重新校对并审校后发布 v2', r.status === 201 && r.json.publication.version === 2, JSON.stringify(r.json));
 }
 
+async function qcTests() {
+  console.log('26. 质检：阈值配置（正数校验、乐观锁、译文轨保护）');
+  const qv = await uploadVideo('质检视频', 60000, 48);
+
+  // 初始无规则
+  let r = await req('GET', `/videos/${qv.id}/qc/rules`);
+  eq('初始规则均为空', [r.json.source, r.json.translation], [null, null]);
+
+  // 阈值必须为正数
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 0 });
+  check('max_cps=0 -> 422', r.status === 422 && r.json.error.code === 'invalid_qc_threshold', JSON.stringify(r.json));
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: -3 });
+  check('max_cps 负数 -> 422', r.status === 422);
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_line_chars: 5.5 });
+  check('单行字符数非整数 -> 422', r.status === 422);
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_line_chars: 'abc' });
+  check('单行字符数非数字 -> 422', r.status === 422);
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'weird', max_cps: 10 });
+  check('非法轨道 -> 422', r.status === 422 && r.json.error.code === 'invalid_qc_track');
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source' });
+  check('无任何阈值 -> 422', r.status === 422 && r.json.error.code === 'missing_qc_threshold');
+  // 译文未启用时不能配置译文规则
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'translation', max_cps: 5 });
+  check('未启用译文轨配置译文规则 -> 422 no_translation_track',
+    r.status === 422 && r.json.error.code === 'no_translation_track');
+
+  // 首次配置成功（无 revision）
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 10, max_line_chars: 4 });
+  check('首次配置原文规则 201', r.status === 201 && r.json.rule.revision === 1, JSON.stringify(r.json));
+  // 不存在的译文规则首次配置却携带 revision -> 422（轨道仍未启用，先被 no_translation_track 拦截，
+  // 故用源轨模拟：源轨已存在规则，缺少 revision 时由 missing_revision 覆盖；这里直接验证
+  // 对已存在规则不带 revision 的修改被拒）
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 5 });
+  check('已存在规则未带 revision -> 422 missing_revision',
+    r.status === 422 && r.json.error.code === 'missing_revision', JSON.stringify(r.json));
+  // 再次配置需匹配 revision；过期 409 并返回当前状态
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 12, revision: 9 });
+  check('过期规则修订号 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict' &&
+    r.json.error.current.max_cps === 10, JSON.stringify(r.json));
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 12, revision: 1 });
+  check('正确修订号修改规则', r.status === 200 && r.json.rule.revision === 2 && r.json.rule.max_cps === 12);
+  // 部分更新：只提交 max_line_chars 时保留 max_cps
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_line_chars: 6, revision: 2 });
+  check('逐键更新保留未提交阈值', r.status === 200 &&
+    r.json.rule.max_cps === 12 && r.json.rule.max_line_chars === 6 && r.json.rule.revision === 3);
+  // 显式 null 取消单项
+  r = await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_line_chars: null, revision: 3 });
+  check('null 取消单行阈值', r.status === 200 && r.json.rule.max_line_chars === null && r.json.rule.max_cps === 12);
+
+  console.log('27. 质检：码点计数、换行不计、速度按时长换算、逐段清单');
+  // 3 秒 6 个码点（含 emoji 代理对），CPS=2；最长行 5（换行不计速度）
+  r = await req('POST', `/videos/${qv.id}/segments`, { start_ms: 0, end_ms: 3000, text: 'ab😀\n一二三四五' });
+  const qa = r.json.segment;
+  check('质检样例片段创建', r.status === 201);
+  // 2 秒 30 个码点 -> CPS 15 > 12；单行 30
+  r = await req('POST', `/videos/${qv.id}/segments`, { start_ms: 5000, end_ms: 7000, text: '一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十' });
+  const qb = r.json.segment;
+  r = await req('GET', `/videos/${qv.id}/qc`);
+  check('质检接口 200', r.status === 200);
+  const segA = r.json.segments.find((s) => s.segment_id === qa.id);
+  const mA = segA.tracks.source.metrics;
+  eq('码点计数（emoji 算 1，换行不计）', mA.chars, 8); // a b 😀 一 二 三 四 五
+  eq('CPS 按片段时长换算（8/3s）', mA.cps, 2.67);
+  eq('最长行逐行计（换行不计长度）', mA.longest_line_chars, 5);
+  check('合规片段无违规', segA.tracks.source.violations.length === 0, JSON.stringify(segA));
+  const vs = r.json.violations.filter((x) => x.segment_id === qb.id);
+  eq('超速片段只报 cps（单行阈值已取消）', vs.map((x) => x.kind), ['cps']);
+  eq('违规清单含轨道/实测/阈值',
+    [vs[0].track, vs[0].actual, vs[0].threshold, vs[0].waived], ['source', 15, 12, false]);
+  eq('未放行计数与 can_publish', [r.json.unwaived_count, r.json.can_publish], [1, false]);
+
+  console.log('28. 质检：单项放行、绑定失效与历史保留');
+  // 放行必须有理由
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: qb.id, track: 'source', kind: 'cps', reason: '   ' });
+  check('空理由 -> 422', r.status === 422 && r.json.error.code === 'invalid_reason');
+  // 不存在的违规不能放行
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: qa.id, track: 'source', kind: 'cps', reason: '尝试放行合规项' });
+  check('无违规放行 -> 422 violation_not_found', r.status === 422 && r.json.error.code === 'violation_not_found');
+  // 错误片段
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: 99999, track: 'source', kind: 'cps', reason: 'x' });
+  check('放行不存在片段 -> 404', r.status === 404);
+  // 规则修订号过期 -> 409 并返回当前规则
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: qb.id, track: 'source', kind: 'cps', reason: '片头快闪', rule_revision: 1 });
+  check('放行携带过期规则修订号 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict' &&
+    r.json.error.current_rule.revision === 4, JSON.stringify(r.json));
+  // 正确放行
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: qb.id, track: 'source', kind: 'cps', reason: '片头快闪，人工确认', created_by: 'tester', rule_revision: 4 });
+  check('放行成功 201', r.status === 201 && r.json.waiver.bound_text.length === 30 &&
+    r.json.waiver.bound_max_cps === 12, JSON.stringify(r.json));
+  // 幂等：再放行同一仍然有效的违规
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: qb.id, track: 'source', kind: 'cps', reason: '再来一次', rule_revision: 4 });
+  check('重复放行幂等 200 already_exists', r.status === 200 && r.json.already_exists === true);
+  r = await req('GET', `/videos/${qv.id}/qc`);
+  eq('放行后计数更新', [r.json.unwaived_count, r.json.waived_count, r.json.can_publish], [0, 1, true]);
+
+  // 放行历史可查且有效
+  r = await req('GET', `/videos/${qv.id}/qc/waivers`);
+  check('放行历史列出且当前有效', r.json.waivers.length >= 1 && r.json.waivers[0].valid === true &&
+    r.json.waivers[0].reason === '片头快闪，人工确认', JSON.stringify(r.json));
+
+  // 文本变化 -> 放行失效但历史保留
+  r = await req('PUT', `/videos/${qv.id}/segments/${qb.id}`, {
+    start_ms: 5000, end_ms: 7000,
+    text: '一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十改动', revision: qb.revision,
+  });
+  check('修改违规片段文本 200', r.status === 200);
+  r = await req('GET', `/videos/${qv.id}/qc/waivers`);
+  const w0 = r.json.waivers[0];
+  check('文本变化后放行失效', w0.valid === false && w0.invalid_reason === '文本已变化', JSON.stringify(w0));
+  eq('历史理由保留', w0.reason, '片头快闪，人工确认');
+  r = await req('GET', `/videos/${qv.id}/qc`);
+  check('失效放行不再解除阻断', r.json.unwaived_count === 1 && r.json.can_publish === false);
+
+  // 恢复文本（内容与放行绑定时一致；时间未变）-> 旧放行本就绑定该文本/时间/阈值，
+  // 重新放行仍幂等命中旧放行，不新增历史行
+  const qbRev2 = (await req('GET', `/videos/${qv.id}`)).json.segments.find((s) => s.id === qb.id).revision;
+  r = await req('PUT', `/videos/${qv.id}/segments/${qb.id}`, {
+    start_ms: 5000, end_ms: 7000,
+    text: '一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十', revision: qbRev2,
+  });
+  check('恢复原文本 200', r.status === 200);
+  const beforeHistory = (await req('GET', `/videos/${qv.id}/qc/waivers`)).json.waivers.length;
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: qb.id, track: 'source', kind: 'cps', reason: '再次尝试', rule_revision: 4 });
+  check('绑定内容恢复后旧放行重新生效，放行幂等 200', r.status === 200 && r.json.already_exists === true);
+  const afterHistory = (await req('GET', `/videos/${qv.id}/qc/waivers`)).json.waivers.length;
+  eq('幂等放行不新增历史行', afterHistory, beforeHistory);
+
+  // 阈值变化后旧放行失效，放行同一违规产生新历史行
+  await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 11, revision: 4 });
+  r = await req('GET', `/videos/${qv.id}/qc/waivers`);
+  check('阈值变化 -> 旧放行失效', r.json.waivers.some((w) => w.invalid_reason === '阈值已变化'), JSON.stringify(r.json));
+  r = await req('POST', `/videos/${qv.id}/qc/waivers`,
+    { segment_id: qb.id, track: 'source', kind: 'cps', reason: '阈值 11 下放行', rule_revision: 5 });
+  check('新阈值下重新放行 201', r.status === 201);
+  check('重新放行新增历史行（旧历史保留）',
+    (await req('GET', `/videos/${qv.id}/qc/waivers`)).json.waivers.length === afterHistory + 1);
+  // 恢复阈值到 12 供后续发布用例
+  await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 12, revision: 5 });
+
+  console.log('29. 质检：发布时重新质检、阻断不产生版本、版本固定规则/结果/放行');
+  // 未审片段存在 + 已放行违规 -> 审校门禁先挡
+  await req('POST', `/videos/${qv.id}/segments/${qa.id}/review`, { reviewed: true, revision: qa.revision });
+  const qbCur = (await req('GET', `/videos/${qv.id}`)).json.segments.find((s) => s.id === qb.id);
+  await req('POST', `/videos/${qv.id}/segments/${qb.id}/review`, { reviewed: true, revision: qbCur.revision });
+  r = await req('POST', `/videos/${qv.id}/publish`, {});
+  check('全部已审且无未放行违规 -> 发布成功', r.status === 201 && r.json.publication.version === 1, JSON.stringify(r.json));
+  eq('发布列表标记含质检记录', r.json.publication.has_qc, true);
+
+  // 发布后收紧阈值制造新违规 -> 重新质检阻断发布且不产生版本
+  const srcRule = (await req('GET', `/videos/${qv.id}/qc/rules`)).json.source;
+  await req('PUT', `/videos/${qv.id}/qc/rules`, { track: 'source', max_cps: 1, revision: srcRule.revision });
+  const pubsBefore = (await req('GET', `/videos/${qv.id}/publications`)).json.publications.length;
+  r = await req('POST', `/videos/${qv.id}/publish`, {});
+  check('发布时重新质检：未放行违规阻止发布', r.status === 422 && r.json.error.code === 'not_publishable' &&
+    r.json.error.quality.unwaived_count >= 2, JSON.stringify(r.json.error.quality));
+  check('阻断返回违规清单（含轨道/实测/阈值）',
+    r.json.error.qc_violations.every((x) => x.track && typeof x.actual === 'number' && x.threshold === 1) &&
+    r.json.error.qc_violations.length >= 2);
+  check('pending 含 qc_source_cps 原因',
+    r.json.error.pending.some((p) => p.reasons.includes('qc_source_cps')), JSON.stringify(r.json.error.pending));
+  const pubsAfter = (await req('GET', `/videos/${qv.id}/publications`)).json.publications.length;
+  eq('阻断发布不产生版本', pubsAfter, pubsBefore);
+
+  // 版本质检记录可查固定内容
+  r = await req('GET', `/videos/${qv.id}/publications/1/qc`);
+  check('版本质检记录 available', r.status === 200 && r.json.available === true);
+  eq('固定的规则为发布时阈值', r.json.rules.source.max_cps, 12);
+  eq('固定的质检结果与有效放行', [r.json.unwaived_count, r.json.waived_count, r.json.valid_waivers.length], [0, 1, 1]);
+  r = await req('GET', `/videos/${qv.id}/publications/999/qc`);
+  check('不存在版本 -> 404', r.status === 404);
+
+  // 阈值再变化后，已发布版本固定记录不变
+  r = await req('GET', `/videos/${qv.id}/publications/1/qc`);
+  eq('历史版本质检记录保持不可变', r.json.rules.source.max_cps, 12);
+
+  // 旧发布版本（质检功能前）行为：用已有的历史视频验证旧版本 SRT 不变由其他用例保证；
+  // 这里验证删除规则后不再阻断
+  const ruleNow = (await req('GET', `/videos/${qv.id}/qc/rules`)).json.source;
+  r = await req('DELETE', `/videos/${qv.id}/qc/rules/source`, { revision: ruleNow.revision });
+  check('删除规则需修订号且成功', r.status === 200);
+  r = await req('DELETE', `/videos/${qv.id}/qc/rules/source`, { revision: 1 });
+  check('重复删除 -> 404', r.status === 404 && r.json.error.code === 'qc_rule_not_found');
+  r = await req('GET', `/videos/${qv.id}/qc`);
+  eq('删除规则后无检查轨道', r.json.checked_tracks, []);
+  eq('删除规则后质检不阻断', r.json.can_publish, true);
+  // 放行历史仍保留
+  r = await req('GET', `/videos/${qv.id}/qc/waivers`);
+  check('删除规则后历史放行仍保留', r.json.waivers.length >= 2, JSON.stringify(r.json.waivers.length));
+
+  console.log('30. 质检：译文轨规则（未启用只查原文、停用清除规则、双轨独立阈值）');
+  const tv = await uploadVideo('质检双轨', 20000, 48);
+  const t1 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 0, end_ms: 1000, text: '你好世界' })).json.segment;
+  await req('PUT', `/videos/${tv.id}/qc/rules`, { track: 'source', max_cps: 3 });
+  // 未启用译文：只检查原文（原文 4 字符/1s = 4 > 3）
+  r = await req('GET', `/videos/${tv.id}/qc`);
+  eq('译文未启用时只检查原文', r.json.checked_tracks, ['source']);
+  check('原文超速被发现', r.json.violations.some((x) => x.segment_id === t1.id && x.kind === 'cps'));
+  // 启用译文轨并配置独立阈值
+  await req('PUT', `/videos/${tv.id}/translation/track`, { language: 'en' });
+  await req('PUT', `/videos/${tv.id}/qc/rules`, { track: 'translation', max_cps: 10, max_line_chars: 40 });
+  // 录入译文（Hello world 11 字符 /1s = 11 > 10；缺失时不产生违规）
+  r = await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'Hello world', segment_revision: 1 });
+  check('录入译文', r.status === 201);
+  r = await req('GET', `/videos/${tv.id}/qc`);
+  eq('双轨都检查', r.json.checked_tracks.sort(), ['source', 'translation']);
+  const trV = r.json.violations.filter((x) => x.track === 'translation');
+  eq('译文速度按片段时长换算并独立判违规', [trV.length, trV[0].actual, trV[0].language], [1, 11, 'en']);
+  // 放行译文违规（携带译文规则 rev=1）
+  r = await req('POST', `/videos/${tv.id}/qc/waivers`,
+    { segment_id: t1.id, track: 'translation', kind: 'cps', reason: '英文片头', rule_revision: 1 });
+  check('译文违规可放行', r.status === 201);
+  // 原文违规仍未放行
+  r = await req('GET', `/videos/${tv.id}/qc`);
+  eq('双轨放行计数独立', [r.json.waived_count, r.json.unwaived_count], [1, 1]);
+
+  // 停用译文轨：译文规则删除、译文放行失效（历史保留），只查原文
+  r = await req('DELETE', `/videos/${tv.id}/translation/track`);
+  check('停用译文轨 204', r.status === 204);
+  r = await req('GET', `/videos/${tv.id}/qc/rules`);
+  eq('停用后译文规则被删除', r.json.translation, null);
+  r = await req('GET', `/videos/${tv.id}/qc`);
+  eq('停用后只检查原文', r.json.checked_tracks, ['source']);
+  r = await req('GET', `/videos/${tv.id}/qc/waivers`);
+  const trWaiver = r.json.waivers.find((w) => w.track === 'translation');
+  check('译文放行失效但历史保留', trWaiver.valid === false && trWaiver.invalid_reason === '译文轨道已停用',
+    JSON.stringify(trWaiver));
+
+  // 重新启用同语言译文轨：规则需要重新配置；旧放行不会自动复活
+  await req('PUT', `/videos/${tv.id}/translation/track`, { language: 'en' });
+  r = await req('GET', `/videos/${tv.id}/qc/rules`);
+  eq('重新启用轨道不恢复规则', r.json.translation, null);
+  r = await req('GET', `/videos/${tv.id}/qc/waivers`);
+  check('旧译文放行不会自动复活', r.json.waivers.find((w) => w.track === 'translation').valid === false);
+
+  console.log('31. 质检：双轨齐备发布固定两轨规则与放行；旧 SRT 行为不变');
+  await req('PUT', `/videos/${tv.id}/qc/rules`, { track: 'translation', max_cps: 10 });
+  // 原文违规放行 + 译文录入审校 + 原文审校后发布
+  await req('POST', `/videos/${tv.id}/qc/waivers`,
+    { segment_id: t1.id, track: 'source', kind: 'cps', reason: '原文片头', rule_revision: 1 });
+  await req('POST', `/videos/${tv.id}/segments/${t1.id}/review`, { reviewed: true, revision: 1 });
+  // 译文需重新录入（轨道停用删过译文）
+  const t1rev = (await req('GET', `/videos/${tv.id}`)).json.segments.find((s) => s.id === t1.id).revision;
+  await req('PUT', `/videos/${tv.id}/segments/${t1.id}/translation`, { text: 'Hi world!!', segment_revision: t1rev });
+  const trJson = (await req('GET', `/videos/${tv.id}`)).json;
+  const trRow = trJson.translations.find((x) => x.segment_id === t1.id);
+  await req('POST', `/videos/${tv.id}/segments/${t1.id}/translation/review`,
+    { reviewed: true, segment_revision: t1rev, revision: trRow.revision });
+  r = await req('POST', `/videos/${tv.id}/publish`, {});
+  check('双轨质检放行齐备 -> 发布 v1', r.status === 201 && r.json.publication.version === 1, JSON.stringify(r.json));
+  r = await req('GET', `/videos/${tv.id}/publications/1/qc`);
+  check('版本固定双轨规则', r.json.available && r.json.rules.source && r.json.rules.translation);
+  eq('版本固定原文放行', r.json.valid_waivers.some((w) => w.track === 'source' && w.kind === 'cps'), true);
+  // 旧 SRT 导出行为完全不变
+  const srt = await (await fetch(`${BASE}/videos/${tv.id}/srt?version=1`)).text();
+  check('原文 SRT 导出不变', /你好世界/.test(srt), srt);
+  const trSrt = await (await fetch(`${BASE}/videos/${tv.id}/srt/translation?version=1`)).text();
+  check('译文 SRT 导出不变', /Hi world!!/.test(trSrt), trSrt);
+}
+
 const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
   env: {
     ...process.env,
@@ -1083,14 +1350,28 @@ let serverOut = '';
 server.stdout.on('data', (d) => { serverOut += d; });
 server.stderr.on('data', (d) => { serverOut += d; });
 
+// 若本次测试服务根本没启动起来（如端口被残留进程占用），立即失败，
+// 避免所有请求打到占用端口的旧服务上得到误导性结果
+server.on('exit', (code) => {
+  if (code !== 0 && code !== null) {
+    console.error('测试服务异常退出：\n' + serverOut);
+    process.exit(1);
+  }
+});
+
 async function waitForServer(retries = 40) {
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(`${BASE}/videos`);
-      if (res.ok) return;
+      if (res.ok) {
+        // 确认连上的是本次启动的进程（子进程仍存活），而非占用同端口的残留服务
+        if (server.killed) throw new Error('测试服务进程已退出（可能端口被占用）：\n' + serverOut);
+        return;
+      }
     } catch (_) { /* 未就绪 */ }
     await new Promise((r) => setTimeout(r, 250));
   }
+  server.kill();
   throw new Error('服务器启动超时：\n' + serverOut);
 }
 

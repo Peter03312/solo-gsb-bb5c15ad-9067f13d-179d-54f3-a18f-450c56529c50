@@ -208,6 +208,91 @@
     </div>
   </div>
 
+  <!-- 质检弹窗 -->
+  <div id="qcModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>字幕质检（每秒字符数 / 单行字符数）</h3>
+      <p class="meta">为<b>原文</b>与<b>已启用译文轨</b>分别配置阈值（阈值为正数；未配置的指标不检查、不阻断）。
+        字符按 <b>Unicode 码点</b>计数，换行不计入速度与单行长度；速度按片段时长换算。
+        对单项违规可填写理由<b>放行</b>，放行绑定片段时间、文本、轨道语言与当时阈值，任一变化后失效（历史理由保留）。
+        <b>发布时会重新质检</b>，未放行违规将阻止发布且不产生版本。原有审校门禁始终适用。</p>
+
+      <div class="qc-config">
+        <div class="qc-config-row" id="qcConfigSource"></div>
+        <div class="qc-config-row" id="qcConfigTranslation"></div>
+      </div>
+      <p id="qcConfigMsg" class="error"></p>
+
+      <div class="qc-summary" id="qcSummary"></div>
+      <p id="qcError" class="error"></p>
+      <div class="import-scroll">
+        <table class="seg-table">
+          <thead><tr><th>#</th><th>轨道</th><th>时间/时长</th><th>实测值</th><th>阈值</th><th>违规与放行</th></tr></thead>
+          <tbody id="qcTbody"></tbody>
+        </table>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="qcHistoryBtn">放行历史（<span id="qcHistoryCount">0</span>）</button>
+        <button type="button" class="btn ghost" id="qcCancel">关闭</button>
+        <button type="button" class="btn primary" id="qcRefreshBtn">重新质检</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 放行理由弹窗 -->
+  <div id="waiverModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>填写放行理由</h3>
+      <p class="meta">片段 #<span id="waiverSegId"></span> ｜ <span id="waiverTrack"></span> ｜ <span id="waiverKind"></span></p>
+      <p class="meta" id="waiverDetail"></p>
+      <label class="block">放行理由（绑定该片段时间、文本、轨道语言与当前阈值；任一项变化后失效）
+        <textarea id="waiverReason" rows="4" maxlength="500" placeholder="例如：片头快闪字幕，经人工确认可读性没问题"></textarea>
+      </label>
+      <p id="waiverError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="waiverCancel">取消</button>
+        <button type="button" class="btn primary" id="waiverSave">确认放行</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 放行历史弹窗 -->
+  <div id="waiverHistoryModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>放行历史</h3>
+      <p class="meta">历史放行理由全部保留；绑定的片段时间/文本/轨道语言/阈值任一变化后即失效，失效放行不再解除阻断。</p>
+      <div class="import-scroll">
+        <table class="seg-table">
+          <thead><tr><th>#</th><th>片段</th><th>轨道</th><th>违规项</th><th>绑定阈值</th><th>理由</th><th>状态</th></tr></thead>
+          <tbody id="waiverHistoryTbody"></tbody>
+        </table>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn primary" id="waiverHistoryClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 发布版本质检记录弹窗 -->
+  <div id="pubQcModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>已发布版本质检记录 <span id="pubQcVersion" class="meta"></span></h3>
+      <p class="meta">该记录为发布时刻固定的规则、质检结果与有效放行，不可变。旧版本（质检功能上线前发布）无此记录。</p>
+      <div id="pubQcSummary" class="qc-summary"></div>
+      <p id="pubQcError" class="error"></p>
+      <div class="import-scroll">
+        <table class="seg-table">
+          <thead><tr><th>#</th><th>轨道</th><th>时间/时长</th><th>违规项</th><th>放行理由</th></tr></thead>
+          <tbody id="pubQcTbody"></tbody>
+        </table>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn primary" id="pubQcClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/app.js"></script>

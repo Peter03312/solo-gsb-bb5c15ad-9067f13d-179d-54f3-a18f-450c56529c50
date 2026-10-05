@@ -46,6 +46,15 @@
   - 成功后**仅移动所选原文片段**：时间加上偏移、修订号逐段 +1、撤销原文审校（文字不变）；未选片段完全不动；
   - 所选片段的**译文保留文字但标记为「已失效」**，须按新时间重新校对并再审；发布门禁与译文 SRT 导出据此阻止直接发布；历史发布版本及其原文/译文 SRT 导出结果保持不变；
   - 空选择、重复或不存在的片段 ID、非整数/为零偏移都返回明确的 `422` 错误；预览后草稿发生任何增删改或审校变化，确认返回 `409` 并要求重新预览。
+- **字幕质检（可配置阈值 + 逐段报告 + 单项放行）**：
+  - 每个视频可分别为**原文轨**与**已启用译文轨**各配置两个独立阈值：**最大每秒字符数 `max_cps`（正数，可小数）**与**最大单行字符数 `max_line_chars`（正整数）**；阈值必须为正数，未配置（留空/null）的指标不检查、不阻断；译文未启用时只检查原文；
+  - 字符一律按 **Unicode 码点**计数（emoji/代理对各算 1 个），**换行符不计入**字符数与速度；多行文本逐行计单行长度（取最长行并指出行号）；速度 `cps = 字符数 / 片段时长（秒）`，按片段毫秒时长换算；
+  - 质检逐段列出**轨道、实测值（字符数/时长/速度/最长行）、阈值与违规项**，工作台片段表对未放行违规显示角标，质检弹窗与片段行都可「定位」到视频时间；
+  - 对**单项违规可填写理由放行**；放行绑定**片段时间、文本、轨道语言与当时阈值**，任一变化后即失效，但历史理由永久保留（可查有效/失效及失效原因）；相同内容重复放行幂等；
+  - **发布时在事务内重新质检**：存在未放行违规即拒绝发布、返回完整违规清单且**不产生版本**；成功版本固定发布时刻的**规则、质检结果与有效放行**，可通过版本接口查询；
+  - **原有审校门禁始终适用**（未审/译文缺失/失效等照常阻断），质检是叠加门禁；未配置阈值的轨道不增加任何阻断；
+  - 质检规则修改带乐观锁 `revision`，过期提交返回 `409` 与当前规则；放行时携带所见规则修订号，规则被并发修改同样拒绝并返回当前状态；
+  - 停用译文轨道会一并删除译文质检规则（历史放行保留并随即失效）；**旧发布版本与两种 SRT 导出行为完全不变**（旧版本无质检快照时查询明确返回 `available:false`）。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -86,7 +95,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出等 332 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，以及质检阈值配置/码点计数/逐段报告/单项放行与失效/发布重检阻断/版本固定规则与放行/双轨与停用清理等 409 个断言）：
 
 ```bash
 npm test
@@ -127,9 +136,14 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
    恢复片段为待审，需重新审校后才能再次发布。
 7. 需要译文时，在右侧「发布与下载」面板输入语言（如 `en`）启用译文轨道：片段表随即出现译文列，
    逐段「录译文/改译文」并按当前原文审校；原文被改动后对应译文显示「已失效」，重新保存译文即完成重新校对。
-8. 右侧「发布与下载」面板实时列出阻塞发布的问题（含译文缺失/待审/已失效）；全部满足后点「发布新版本」，
-   启用轨道时发布会同时固定原文与译文两轨快照。
-9. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
+8. 右侧「发布与下载」面板实时列出阻塞发布的问题（含译文缺失/待审/已失效）；需要质检时点「🛡 质检…」：
+   分别为原文/译文轨填写「最大每秒字符数」「最大单行字符数」（正数；留空=该项不检查，未配置阈值不阻断）并保存；
+   弹窗逐段列出轨道、实测值、阈值与违规项，可点「定位」跳到该片段；对个别合理违规点「填写理由放行」
+   （放行绑定片段时间、文本、轨道语言与当时阈值，任一变化后失效；「放行历史」可查全部理由及失效原因）；
+   未放行违规会与审校问题一起阻止发布。片段表状态列也会显示「质检违规 N / 已放行 N」角标。
+9. 全部满足后点「发布新版本」，发布时服务端**重新质检**：未放行违规会阻止发布并弹出清单；成功发布启用轨道时同时固定原文与译文两轨快照，
+   并固定该版本的质检规则、结果与有效放行（历史发布列表点「查看质检记录」可查）。
+10. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
 
 ## HTTP API 摘要
 
@@ -161,6 +175,13 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `PUT` | `/api/videos/:id/segments/:sid/translation` | 录入/修改译文 `{text,segment_revision,revision?（已有译文时必填）}`；修改撤销译文审校 |
 | `POST` | `/api/videos/:id/segments/:sid/translation/review` | 译文审校切换 `{reviewed,segment_revision,revision}`；已失效译文拒绝审校 |
 | `GET` | `/api/videos/:id/srt/translation?version=` | 导出译文 SRT：`draft`（默认，需齐备且未失效）/ `published` / 版本号（需该版本含译文快照） |
+| `GET` | `/api/videos/:id/qc/rules` | 查看质检规则 `{source, translation, translation_enabled}`（未配置为 `null`） |
+| `PUT` | `/api/videos/:id/qc/rules` | 配置阈值 `{track:'source'\|'translation', max_cps?, max_line_chars?, revision?}`；阈值正数（单行须正整数），显式 `null` 取消该项；首次无 `revision`，之后须带规则修订号，过期 `409` 返回当前规则 |
+| `DELETE` | `/api/videos/:id/qc/rules/:track` | 删除该轨道质检配置（JSON 体带规则 `revision`；历史放行保留） |
+| `GET` | `/api/videos/:id/qc` | 当前草稿质检结果：`checked_tracks`、逐段 `segments[].tracks[].metrics/violations`、扁平 `violations[]`（轨道/实测/阈值/放行）、`unwaived_count`/`waived_count`/`can_publish` |
+| `POST` | `/api/videos/:id/qc/waivers` | 单项违规放行 `{segment_id, track, kind:'cps'\|'line_chars', reason, rule_revision?}`；绑定时间/文本/语言/阈值；规则修订号过期 `409`；重复有效放行幂等 |
+| `GET` | `/api/videos/:id/qc/waivers` | 放行历史（含每条当前 `valid` 与 `invalid_reason`，失效行永久保留） |
+| `GET` | `/api/videos/:id/publications/:version/qc` | 已发布版本固定的规则、质检结果与有效放行；旧版本返回 `{available:false}` |
 
 错误响应统一为 `{ "error": { "code", "message", "current?" } }`：
 `422` 为非法修改（含原因），`409` 为修订冲突（`current` 为最新片段）。
@@ -414,11 +435,106 @@ curl -s -OJ "http://localhost:8080/api/videos/$V/srt/translation?version=1"
 | `422 translation_incomplete` | 草稿译文缺失或失效，无法导出译文 SRT；`error.pending[]` 逐段指出片段与原因 |
 | `422 translation_unavailable` | 指定发布版本不含译文快照（发布时未启用轨道） |
 
+### 质检调用示例（配置阈值 → 质检 → 单项放行 → 发布重检 → 版本记录）
+
+每个视频可分别为原文轨（`source`）与已启用译文轨（`translation`）配置 **最大每秒字符数**（正数，可小数）与
+**最大单行字符数**（正整数）。字符按 Unicode 码点计数、换行不计；速度按片段时长换算。
+规则配置采用乐观锁：首次创建无需修订号，之后每次修改携带所见规则 `revision`，过期返回 `409` 与当前规则。
+
+```bash
+V=12  # 视频 id
+
+# 1) 配置原文阈值（首次创建，无需 revision）
+curl -s -X PUT http://localhost:8080/api/videos/$V/qc/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"track":"source","max_cps":15,"max_line_chars":42}'
+# -> 201 {"ok":true,"rule":{"track":"source","max_cps":15,"max_line_chars":42,"revision":1,...}}
+
+# 阈值必须为正数；可只配一项；显式 null 取消该项；已存在规则须带 revision
+curl -s -X PUT http://localhost:8080/api/videos/$V/qc/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"track":"source","max_cps":17,"revision":1}'
+# -> 200（逐键更新，未提交的 max_line_chars 保持不变，revision 递增为 2）
+
+# 2) 为已启用译文轨配置独立阈值（未启用译文轨时 422 no_translation_track）
+curl -s -X PUT http://localhost:8080/api/videos/$V/qc/rules \
+  -H 'Content-Type: application/json' -d '{"track":"translation","max_cps":20}'
+
+# 3) 对当前草稿质检（逐段列出轨道、实测值、阈值与违规项）
+curl -s http://localhost:8080/api/videos/$V/qc
+```
+
+质检返回（节选）：
+
+```json
+{
+  "checked_tracks": ["source"],
+  "rules": { "source": { "track": "source", "max_cps": 17, "max_line_chars": 42, "revision": 2 } },
+  "segments": [
+    { "segment_id": 7, "start_ms": 1000, "end_ms": 2000,
+      "tracks": { "source": {
+        "metrics": { "chars": 30, "duration_ms": 1000, "cps": 30, "longest_line_chars": 30 },
+        "violations": [
+          { "track": "source", "kind": "cps", "threshold": 17, "actual": 30, "chars": 30,
+            "duration_ms": 1000, "message": "每秒字符数 30 超过阈值 17（30 字符 / 1.000 秒，换行不计）" },
+          { "track": "source", "kind": "line_chars", "threshold": 42, "actual": 30, "line": 1 }
+        ] } } }
+  ],
+  "violations": [ { "segment_id": 7, "track": "source", "kind": "cps",
+                    "threshold": 17, "actual": 30, "waived": false, "waiver": null } ],
+  "unwaived_count": 1, "waived_count": 0, "can_publish": false
+}
+```
+
+对单项违规填写理由放行（建议携带当前规则修订号；规则被并发修改时返回 `409` 与 `current_rule`）：
+
+```bash
+# 4) 放行片段 #7 的 cps 违规（绑定时间 1000–2000、文本、原文语言 null、阈值 17）
+curl -s -X POST http://localhost:8080/api/videos/$V/qc/waivers \
+  -H 'Content-Type: application/json' \
+  -d '{"segment_id":7,"track":"source","kind":"cps","reason":"片头快闪，人工确认可读","rule_revision":2}'
+# -> 201；对仍然有效的同一违规重复提交 -> 200 {"already_exists":true}（幂等，不重复写历史）
+
+# 5) 查看放行历史（含每条当前是否有效及失效原因；失效行保留）
+curl -s http://localhost:8080/api/videos/$V/qc/waivers
+# -> {"waivers":[{"id":1,...,"valid":false,"invalid_reason":"文本已变化",...}], ...}
+```
+
+发布时服务端在事务内**重新质检**：有未放行违规（或原有审校/译文门禁未过）即拒绝、返回完整清单且不产生版本；
+成功版本固定当时的规则、质检结果与有效放行，可随时查询（旧版本无质检快照时返回 `available:false`）：
+
+```bash
+# 6) 发布（未放行违规 -> 422，附 pending 与 qc_violations 完整清单，不产生版本）
+curl -s -X POST http://localhost:8080/api/videos/$V/publish
+# 422 error.code=not_publishable
+# error.pending[].reasons 含 "qc_source_cps" / "qc_translation_line_chars" 等
+# error.qc_violations[] 逐段给出 track/kind/actual/threshold/waived
+
+# 7) 查询版本 v3 固定的规则、质检结果与有效放行
+curl -s http://localhost:8080/api/videos/$V/publications/3/qc
+# -> {"available":true,"version":3,"rules":{...},"violations":[...],"valid_waivers":[...]}
+```
+
+质检相关失败约定：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 invalid_qc_threshold` | 阈值非法（非正数；单行字符数非正整数；超过 1000000 上限） |
+| `422 invalid_qc_track` / `invalid_qc_kind` | `track` 不是 `source`/`translation`；`kind` 不是 `cps`/`line_chars` |
+| `422 missing_qc_threshold` | 请求未提供任何阈值（请用 `null` 显式取消或用 DELETE 删除配置） |
+| `422 no_translation_track` | 译文轨未启用却配置/放行译文质检；译文未启用时只检查原文 |
+| `422 missing_revision` / `unexpected_revision` | 已存在规则未带 `revision` / 首次创建却带了 `revision` |
+| `409 revision_conflict` | 规则修订号或放行时的规则修订号过期；`error.current`（放行接口为 `error.current_rule`）返回当前规则 |
+| `422 invalid_reason` | 放行理由为空或超过 500 字 |
+| `422 violation_not_found` | 该片段当前不存在对应违规（可能已被修正或阈值已取消），无需放行 |
+| `404 qc_rule_not_found` / `segment_not_found` | DELETE 的规则不存在；放行指向的片段不存在 |
+| `404 version_not_found` | 查询版本质检记录时版本不存在 |
+
 ## 数据布局
 
 ```
 data/
-├── app.db            # SQLite：videos / segments / translations / publications
+├── app.db            # SQLite：videos / segments / translations / qc_rules / qc_waivers / publications
 └── videos/           # 上传的原始视频文件（随机化文件名）
 ```
 
