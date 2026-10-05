@@ -239,3 +239,19 @@ tr.import-conflict td { background: rgba(240,169,59,.12); }
 .upload-row > label { flex: 1; min-width: 160px; font-size: 12px; color: var(--muted); }
 .upload-row input { margin-top: 4px; }
 #uploadMsg { color: var(--warn); font-size: 13px; margin-top: 8px; }
+
+/* 质检（QC）面板 */
+.qc-rules-table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+.qc-rules-table th, .qc-rules-table td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; }
+.qc-rules-table input { width: 100%; box-sizing: border-box; }
+.qc-scroll { max-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; margin: 6px 0 10px; }
+.qc-table { font-size: 12.5px; }
+.qc-table tr.qc-bad td { background: rgba(239,95,111,.10); }
+.qc-table tr.qc-waived td { background: rgba(52,199,138,.08); }
+.qc-table tr.qc-hist td { color: var(--muted); }
+.qc-reason-cell { max-width: 260px; }
+.qc-seek { color: var(--primary); cursor: pointer; text-decoration: none; }
+.qc-seek:hover { text-decoration: underline; }
+.good { color: var(--ok); }
+.bad { color: var(--danger); }
+#qcCard hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }

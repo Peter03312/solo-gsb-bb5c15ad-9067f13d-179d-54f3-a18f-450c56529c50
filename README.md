@@ -46,6 +46,14 @@
   - 成功后**仅移动所选原文片段**：时间加上偏移、修订号逐段 +1、撤销原文审校（文字不变）；未选片段完全不动；
   - 所选片段的**译文保留文字但标记为「已失效」**，须按新时间重新校对并再审；发布门禁与译文 SRT 导出据此阻止直接发布；历史发布版本及其原文/译文 SRT 导出结果保持不变；
   - 空选择、重复或不存在的片段 ID、非整数/为零偏移都返回明确的 `422` 错误；预览后草稿发生任何增删改或审校变化，确认返回 `409` 并要求重新预览。
+- **质检（QC）阈值、逐段报告与单项放行**：
+  - 每个视频可分别为**原文**与**已启用译文**轨道配置 `最大每秒字符数（CPS）` 与 `最大单行字符数` 两个阈值；阈值必须为正数（单行字符数为正整数，CPS 可为小数），留空/`null` 表示该项不检查；
+  - **按 Unicode 码点计数**（emoji 等代理对算 1 个字符）；**换行不计入速度**，速度 = 非换行字符数 ÷ 片段时长（秒，`(end_ms-start_ms)/1000`）；单行字符数按换行切分后取最长行；
+  - 质检报告**逐段列出轨道、实测值、阈值与违规项**（含中文说明、所在行号、字符数、时长），工作台点击时间即可**定位**到该片段；
+  - 对**单项违规可填写理由放行**；放行绑定放行时的**片段时间、文本、轨道语言与当时阈值（规则修订号）**，任一变化后放行自动**失效**（不会因内容改回而复活），但失效放行与理由**作为历史保留**可查；
+  - **发布时服务端重新质检**：未放行的违规阻止发布、返回完整违规清单且**不产生版本**；成功发布的版本可查到**固定的规则、质检结果与有效放行**（发布后再改草稿不影响版本快照）；
+  - **原有审校门禁始终适用**（未审/译文缺失/失效/待审照样阻止发布）；**未配置阈值的轨道不增加任何阻断**；**译文未启用时只检查原文**；旧发布版本（无质检快照）及其 SRT 导出行为完全不变；
+  - 规则与放行都走**乐观锁并发控制**：规则修改携带 `rules_revision`（首次传 `0`），译文放行同时携带原文/译文双修订号；过期提交返回 `409` 与当前状态，绝不覆盖他人修改；规则阈值变化会使既有放行整体失效（历史保留）。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -86,7 +94,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出等 332 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，以及质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝等 422 个断言）：
 
 ```bash
 npm test
@@ -129,12 +137,18 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
    逐段「录译文/改译文」并按当前原文审校；原文被改动后对应译文显示「已失效」，重新保存译文即完成重新校对。
 8. 右侧「发布与下载」面板实时列出阻塞发布的问题（含译文缺失/待审/已失效）；全部满足后点「发布新版本」，
    启用轨道时发布会同时固定原文与译文两轨快照。
-9. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
+9. 需要质检限速时，在右侧「质检规则与放行」面板为原文/译文分别填写「最大每秒字符数」「最大单行字符数」
+   （留空不检查；保存需携带规则修订号，阈值变化会使既有放行失效但保留历史）。面板逐段列出违规项，
+   点击时间定位到片段；对单项违规点「填写理由放行」（原文放行带原文修订号，译文放行带原文+译文双修订号）。
+   发布时服务端会重新质检，未放行违规阻止发布；发布成功后可在历史版本处「查看质检快照」核对当时固定的规则、结果与放行。
+10. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
 
 ## HTTP API 摘要
 
 所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认、多片段整体平移确认改持预览令牌 `token`；
 译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`）。
+质检规则修改携带所见规则修订号 `rules_revision`（首次配置传 `0`）；质检放行携带 `segment_revision`，
+译文放行还需译文 `revision`；过期一律 `409 revision_conflict` 并返回当前状态。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -161,6 +175,10 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `PUT` | `/api/videos/:id/segments/:sid/translation` | 录入/修改译文 `{text,segment_revision,revision?（已有译文时必填）}`；修改撤销译文审校 |
 | `POST` | `/api/videos/:id/segments/:sid/translation/review` | 译文审校切换 `{reviewed,segment_revision,revision}`；已失效译文拒绝审校 |
 | `GET` | `/api/videos/:id/srt/translation?version=` | 导出译文 SRT：`draft`（默认，需齐备且未失效）/ `published` / 版本号（需该版本含译文快照） |
+| `GET` | `/api/videos/:id/qc` | 当前草稿质检结果：逐段轨道/实测值/阈值/违规项 + 全部放行（含失效历史） |
+| `PUT` | `/api/videos/:id/qc/rules` | 配置/修改质检阈值（乐观锁 `rules_revision`，首次传 `0`；字段可 `null` 清除） |
+| `PUT` | `/api/videos/:id/segments/:sid/qc/waiver` | 对单项违规填写理由放行 `{track,rule,reason,segment_revision,revision?}` |
+| `GET` | `/api/videos/:id/publications/:version/qc` | 查询某发布版本固定的质检规则、质检结果与有效放行 |
 
 错误响应统一为 `{ "error": { "code", "message", "current?" } }`：
 `422` 为非法修改（含原因），`409` 为修订冲突（`current` 为最新片段）。
@@ -414,11 +432,113 @@ curl -s -OJ "http://localhost:8080/api/videos/$V/srt/translation?version=1"
 | `422 translation_incomplete` | 草稿译文缺失或失效，无法导出译文 SRT；`error.pending[]` 逐段指出片段与原因 |
 | `422 translation_unavailable` | 指定发布版本不含译文快照（发布时未启用轨道） |
 
+### 质检（QC）调用示例
+
+每个视频可分别为**原文**与**已启用译文**配置 `最大每秒字符数（max_cps）` 与 `最大单行字符数（max_line_chars）`。
+字段省略表示不修改，传 `null` 清除该项；阈值必须为正数（单行字符数须为正整数，CPS 可为小数）。
+字符按 **Unicode 码点**计数，**换行不计入速度**；速度 = 非换行字符数 ÷ 片段秒数。规则修改用 `rules_revision` 乐观锁（首次传 `0`）。
+
+```bash
+V=12
+
+# 1) 首次配置（原文 CPS≤15、单行≤42；译文 CPS≤20、单行≤84）
+curl -s -X PUT http://localhost:8080/api/videos/$V/qc/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"source_max_cps":15,"source_max_line_chars":42,"translation_max_cps":20,"translation_max_line_chars":84,"rules_revision":0}'
+# -> { "ok": true, "rules_revision": 1, "rules": { "revision": 1, "source": {...}, "translation": {...} } }
+
+# 2) 只改一项（携带当前修订号 1）；阈值变化会使既有放行整体失效（历史保留）
+curl -s -X PUT http://localhost:8080/api/videos/$V/qc/rules \
+  -H 'Content-Type: application/json' -d '{"source_max_cps":17,"rules_revision":1}'
+
+# 3) 并发修改拿着过期修订号 -> 409，响应回传当前规则
+#    { "error": { "code":"revision_conflict", "current_rules": {...}, "rules_revision": 1 } }
+
+# 4) 查看当前草稿质检（逐段轨道/实测值/阈值/违规项，含全部放行历史）
+curl -s http://localhost:8080/api/videos/$V/qc
+```
+
+返回（节选）：
+
+```json
+{
+  "rules": { "revision": 2,
+    "source": { "max_cps": 17, "max_line_chars": 42 },
+    "translation": { "language": "en", "max_cps": 20, "max_line_chars": 84 } },
+  "tracks": ["source", "translation"],
+  "configured": true,
+  "segments": [
+    { "segment_id": 7, "start_ms": 1000, "end_ms": 2000, "duration_ms": 1000,
+      "source": { "items": [
+        { "rule": "max_cps", "threshold": 17, "value": 20, "chars": 20, "duration_ms": 1000,
+          "violation": true, "waived": false, "waiver": null } ] },
+      "translation": { "present": true, "stale": false, "language": "en",
+        "items": [ /* 译文轨道逐项实测，结构相同 */ ] } }
+  ],
+  "violations": [
+    { "segment_id": 7, "start_ms": 1000, "end_ms": 2000, "duration_ms": 1000,
+      "track": "source", "rule": "max_cps", "value": 20, "threshold": 17,
+      "waived": false, "waiver": null, "detail": { "chars": 20, "duration_ms": 1000 },
+      "language": null,
+      "message": "原文片段 #7：每秒字符数 20 超过阈值 17（20 个字符 / 1.000 秒）" }
+  ],
+  "blocking_violations": [ /* 未放行的违规（=违规中 waived=false 的子集），阻止发布 */ ],
+  "waivers": [ /* 全部放行：active=true 有效；active=false 已失效（历史理由保留） */ ],
+  "valid_waivers": [ /* 当前仍有效的放行 */ ],
+  "violation_count": 1, "blocking_count": 1,
+  "active_waiver_count": 0, "inactive_waiver_count": 0, "can_publish": false
+}
+```
+
+对单项违规填写理由放行。放行绑定放行时的**片段时间、文本、轨道语言与当时阈值（规则修订号）**，
+任一变化后失效（不复活），理由永久保留在 `waivers[]` 中（`active=false`）：
+
+```bash
+# 原文放行（携带所见原文修订号）
+curl -s -X PUT http://localhost:8080/api/videos/$V/segments/7/qc/waiver \
+  -H 'Content-Type: application/json' \
+  -d '{"track":"source","rule":"max_cps","reason":"片头快语速，已人工逐字校对","segment_revision":3}'
+
+# 译文放行（同时携带原文与译文修订号）
+curl -s -X PUT http://localhost:8080/api/videos/$V/segments/7/qc/waiver \
+  -H 'Content-Type: application/json' \
+  -d '{"track":"translation","rule":"max_line_chars","reason":"英文专有名词较长，人工确认","segment_revision":3,"revision":2}'
+# -> 201 { "waiver": { "id": 1, "active": 1, "bound_start_ms": 1000, "bound_end_ms": 2000,
+#                      "bound_text": "…", "bound_rules_revision": 2, "bound_thresholds": {...} },
+#          "qc": { /* 放行后的最新完整质检报告 */ } }
+```
+
+发布时服务端**重新质检**：存在未放行违规时 `422 qc_blocked`，返回 `qc_violations[]` 清单且不产生版本；
+成功后可查询版本固定的规则、结果与有效放行：
+
+```bash
+curl -s http://localhost:8080/api/videos/$V/publications/3/qc
+# -> { "snapshot": true, "version": 3, "rules_snapshot": {...}, "segments": [...],
+#       "violations": [...], "valid_waivers": [...] }   # 发布后草稿再变也不影响该快照
+# 发布时未配置阈值的旧版本：422 qc_unavailable（旧发布版本与 SRT 导出行为保持不变）
+```
+
+质检相关失败约定：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 invalid_qc_threshold` | 阈值非正数，或单行字符数不是正整数；未写入 |
+| `422 invalid_qc_rules` | 规则体为空 / 不含任何已知阈值字段 |
+| `422 missing_revision` | 缺少 `rules_revision` / 放行缺少 `segment_revision`（译文放行还需 `revision`） |
+| `409 revision_conflict` | 规则修订号、原文或译文修订号过期；`error.current_rules` 或 `error.current` 返回当前状态 |
+| `422 invalid_qc_track` / `invalid_qc_rule` | `track` 不是 `source`/`translation`，或 `rule` 不是 `max_cps`/`max_line_chars` |
+| `422 invalid_waiver_reason` | 放行理由为空或超过 500 字符 |
+| `422 no_such_violation` | 当前该片段该轨道不存在对应违规（阈值未配置或内容已变），无需放行；回传 `current_qc` |
+| `422 waiver_exists` | 该违规已有有效放行；回传 `current_qc` 与既有 `waiver` |
+| `422 no_translation_track` | 未启用译文轨道却对译文违规放行 |
+| `422 qc_blocked` | 发布重新质检发现未放行违规；`error.qc_violations[]` 为完整清单，未生成版本 |
+| `422 qc_unavailable` | 指定发布版本不含质检快照（发布时未配置阈值），旧版本行为不变 |
+
 ## 数据布局
 
 ```
 data/
-├── app.db            # SQLite：videos / segments / translations / publications
+├── app.db            # SQLite：videos / segments / translations / qc_rules / qc_waivers / publications
 └── videos/           # 上传的原始视频文件（随机化文件名）
 ```
 

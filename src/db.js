@@ -46,6 +46,8 @@ function init(dbPath) {
       snapshot     TEXT    NOT NULL,
       translation_snapshot TEXT,
       translation_lang     TEXT,
+      qc_rules_snapshot    TEXT,
+      qc_report_snapshot   TEXT,
       segment_count INTEGER NOT NULL,
       published_at INTEGER NOT NULL,
       UNIQUE (video_id, version)
@@ -72,6 +74,44 @@ function init(dbPath) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_translations_video ON translations(video_id);
+
+    -- 质检规则：每个视频至多一行；四个阈值均可空（未配置该项，不阻断发布）。
+    -- revision 为规则乐观锁：并发修改必须携带所见修订号，过期拒绝并返回当前状态。
+    CREATE TABLE IF NOT EXISTS qc_rules (
+      video_id                  INTEGER PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+      source_max_cps            REAL,
+      source_max_line_chars     INTEGER,
+      translation_max_cps       REAL,
+      translation_max_line_chars INTEGER,
+      revision                  INTEGER NOT NULL DEFAULT 1,
+      updated_at                INTEGER NOT NULL
+    );
+
+    -- 质检放行（豁免）：对单项违规填写理由放行；
+    -- 绑定放行时的片段时间、文本、轨道语言与当时阈值（规则修订号），任一变化后失效；
+    -- active 锁存：失效时置 0 但行保留（保留历史理由）。
+    CREATE TABLE IF NOT EXISTS qc_waivers (
+      id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+      video_id                      INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+      segment_id                    INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+      track                         TEXT    NOT NULL CHECK (track IN ('source', 'translation')),
+      rule                          TEXT    NOT NULL CHECK (rule IN ('max_cps', 'max_line_chars')),
+      language                      TEXT,
+      reason                        TEXT    NOT NULL,
+      active                        INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+      bound_start_ms                INTEGER NOT NULL,
+      bound_end_ms                  INTEGER NOT NULL,
+      bound_text                    TEXT    NOT NULL,
+      bound_rules_revision          INTEGER NOT NULL,
+      bound_source_max_cps          REAL,
+      bound_source_max_line_chars   INTEGER,
+      bound_translation_max_cps     REAL,
+      bound_translation_max_line_chars INTEGER,
+      created_at                    INTEGER NOT NULL,
+      revoked_at                    INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_qc_waivers_video ON qc_waivers(video_id, segment_id);
   `);
 
   // 旧库迁移：为已存在的表补充译文轨道相关列（新库已由上方 CREATE 携带则跳过）
@@ -85,6 +125,12 @@ function init(dbPath) {
   }
   if (!pubCols.includes('translation_lang')) {
     db.exec('ALTER TABLE publications ADD COLUMN translation_lang TEXT');
+  }
+  if (!pubCols.includes('qc_rules_snapshot')) {
+    db.exec('ALTER TABLE publications ADD COLUMN qc_rules_snapshot TEXT');
+  }
+  if (!pubCols.includes('qc_report_snapshot')) {
+    db.exec('ALTER TABLE publications ADD COLUMN qc_report_snapshot TEXT');
   }
 
   return db;

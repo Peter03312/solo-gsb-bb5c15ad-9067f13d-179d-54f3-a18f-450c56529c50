@@ -9,6 +9,8 @@ const state = {
   publications: [],
   translationLang: null, // 译文轨道语言（未启用为 null）
   translations: [],      // 当前草稿全部译文（逐段关联）
+  qcRules: null,         // 质检阈值（含 revision）
+  qcReport: null,        // 当前草稿完整质检报告
   activeSegmentId: null,
   editor: null, // { mode:'create'|'edit', segmentId, revision, initialText, dirty }
   shiftSelected: new Set(), // 整体平移勾选的片段 ID
@@ -190,6 +192,12 @@ async function uploadVideo() {
 }
 
 /* ================= 视图：校对工作台 ================= */
+async function loadQcReport() {
+  const data = await api(`/api/videos/${state.video.id}/qc`);
+  state.qcReport = data;
+  return data;
+}
+
 async function openVideo(id) {
   const data = await api(`/api/videos/${id}`);
   state.view = 'detail';
@@ -198,10 +206,13 @@ async function openVideo(id) {
   state.publications = data.publications;
   state.translationLang = data.translation_lang != null ? data.translation_lang : null;
   state.translations = data.translations || [];
+  state.qcRules = data.qc_rules || null;
+  state.qcReport = null;
   state.activeSegmentId = null;
   state.shiftSelected = new Set();
   render();
   startPolling();
+  loadQcReport().then(() => renderQcPanel()).catch(() => {});
 }
 
 function backToList() { stopPolling(); loadList(); }
@@ -220,7 +231,9 @@ function anyModalOpen() {
          !$('importModal').classList.contains('hidden') ||
          !$('restoreModal').classList.contains('hidden') ||
          !$('shiftModal').classList.contains('hidden') ||
-         !$('trModal').classList.contains('hidden');
+         !$('trModal').classList.contains('hidden') ||
+         !$('qcWaiverModal').classList.contains('hidden') ||
+         !$('qcPubModal').classList.contains('hidden');
 }
 async function pollRefresh() {
   if (anyModalOpen() || !state.video) return;
@@ -235,11 +248,18 @@ async function pollRefresh() {
     state.translations = data.translations || [];
     state.translationLang = data.translation_lang != null ? data.translation_lang : null;
     state.publications = data.publications;
+    state.qcRules = data.qc_rules || null;
     syncShiftSelected();
     if (changed) {
       renderSegmentDependent();
       toast('检测到他人的修改，已刷新片段列表');
     }
+    loadQcReport().then(() => {
+      // 正在质检卡片内编辑阈值（焦点位于卡片输入框）时不重绘，避免冲掉未保存的输入
+      const ae = document.activeElement;
+      const inQcCard = ae && $('qcCard') && $('qcCard').contains(ae);
+      if (!anyModalOpen() && !inQcCard) renderQcPanel();
+    }).catch(() => {});
   } catch (_) { /* 忽略轮询错误 */ }
 }
 function stripSeg(s) {
@@ -303,6 +323,7 @@ function renderDetail() {
       </div>
 
       <div>
+        <section class="card" id="qcCard"></section>
         <section class="card" id="publishCard"></section>
       </div>
     </div>`;
@@ -318,6 +339,7 @@ function renderDetail() {
   renderTimeline();
   renderSegmentTable();
   renderPublishCard();
+  renderQcPanel();
 }
 
 // 仅刷新依赖片段数据的区域（轮询/写操作后），不重建 <video>
@@ -326,6 +348,7 @@ function renderSegmentDependent() {
   renderTimeline();
   renderSegmentTable();
   renderPublishCard();
+  renderQcPanel();
   onTimeUpdate();
 }
 
@@ -593,8 +616,10 @@ async function refreshCurrent() {
   state.publications = data.publications;
   state.translations = data.translations || [];
   state.translationLang = data.translation_lang != null ? data.translation_lang : null;
+  state.qcRules = data.qc_rules || null;
   syncShiftSelected();
   renderSegmentDependent();
+  try { await loadQcReport(); renderQcPanel(); } catch (_) { /* 忽略 */ }
 }
 
 /* ================= 多片段整体平移 ================= */
@@ -732,6 +757,292 @@ function showConflict(message, current, editorCtx) {
   };
 }
 
+/* ================= 质检（QC）：配置、查看与放行 ================= */
+const RULE_NAMES = { max_cps: '每秒字符数（CPS）', max_line_chars: '最大单行字符数' };
+const TRACK_NAMES = { source: '原文', translation: '译文' };
+const qcWaiverEditor = { segmentId: null, track: null, rule: null };
+
+function qcRulesRevision() {
+  return state.qcRules ? state.qcRules.revision : 0;
+}
+
+function fmtThreshold(v) {
+  return v == null ? '<span class="meta">未配置</span>' : esc(String(v));
+}
+
+function renderQcStatusLi(qc) {
+  if (!qc || !qc.configured) {
+    return '<li class="good">质检：未配置阈值（不阻断发布）</li>';
+  }
+  const ok = qc.blocking_count === 0;
+  return `<li class="${ok ? 'good' : 'bad'}">
+    质检：违规 ${qc.violation_count} 项${qc.active_waiver_count ? `｜已放行 ${qc.active_waiver_count} 项` : ''}
+    ${qc.blocking_count ? `｜<b>待放行 ${qc.blocking_count} 项</b>` : '｜无阻断项'}</li>`;
+}
+
+function renderQcPanel() {
+  const card = $('qcCard');
+  if (!card) return;
+  const r = state.qcRules || { revision: 0, source: { max_cps: null, max_line_chars: null }, translation: { max_cps: null, max_line_chars: null } };
+  const rep = state.qcReport;
+  const track = !!state.translationLang;
+  const cfgCount = [r.source.max_cps, r.source.max_line_chars, r.translation.max_cps, r.translation.max_line_chars]
+    .filter((x) => x != null).length;
+
+  card.innerHTML = `
+    <h2>质检规则与放行</h2>
+    <p class="meta">按 Unicode 码点计数；换行不计入速度，速度 = 非换行字符数 ÷ 片段时长（秒）。
+      阈值留空表示该项不检查、不阻断。发布时会重新质检，<b>未放行违规将阻止发布</b>；原有审校门禁始终适用。
+      规则修订号 <b>${r.revision}</b>。</p>
+    <table class="qc-rules-table">
+      <thead><tr><th>轨道</th><th>最大每秒字符数</th><th>最大单行字符数</th></tr></thead>
+      <tbody>
+        <tr><td>原文</td>
+          <td><input type="number" min="0" step="any" id="qcSrcCps" placeholder="留空=不检查" value="${r.source.max_cps ?? ''}" /></td>
+          <td><input type="number" min="1" step="1" id="qcSrcLine" placeholder="留空=不检查" value="${r.source.max_line_chars ?? ''}" /></td></tr>
+        <tr class="${track ? '' : 'hidden'}"><td>译文${track ? `（${esc(state.translationLang)}）` : ''}</td>
+          <td><input type="number" min="0" step="any" id="qcTrCps" placeholder="留空=不检查" value="${r.translation.max_cps ?? ''}" /></td>
+          <td><input type="number" min="1" step="1" id="qcTrLine" placeholder="留空=不检查" value="${r.translation.max_line_chars ?? ''}" /></td></tr>
+      </tbody>
+    </table>
+    <div class="row-actions">
+      <button class="btn small primary" id="qcSaveRules">保存质检规则（修订号 ${r.revision}）</button>
+      <button class="btn small" id="qcRefresh">重新质检</button>
+    </div>
+    <p id="qcRulesMsg" class="meta"></p>
+    <hr>
+    <div id="qcReportBox">${rep ? renderQcReportHtml(rep) : '<p class="meta">质检结果加载中…</p>'}</div>`;
+
+  $('qcSaveRules').addEventListener('click', saveQcRules);
+  $('qcRefresh').addEventListener('click', async () => {
+    try { await loadQcReport(); renderQcPanel(); renderPublishCard(); toast('已重新质检'); }
+    catch (e) { toast(`质检失败：${e.message}`, true); }
+  });
+  if (rep) bindQcReportActions(card, rep);
+}
+
+function qcInputOrNull(id) {
+  const el = $(id);
+  const raw = el.value.trim();
+  if (raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : NaN;
+}
+
+async function saveQcRules() {
+  const msg = $('qcRulesMsg');
+  msg.textContent = '';
+  const body = {
+    source_max_cps: qcInputOrNull('qcSrcCps'),
+    source_max_line_chars: qcInputOrNull('qcSrcLine'),
+    translation_max_cps: qcInputOrNull('qcTrCps'),
+    translation_max_line_chars: qcInputOrNull('qcTrLine'),
+    rules_revision: qcRulesRevision(),
+  };
+  if (Object.values(body).some((v) => Number.isNaN(v))) {
+    msg.textContent = '阈值必须为正数（单行字符数为正整数）；留空表示不检查。';
+    msg.className = 'error';
+    return;
+  }
+  try {
+    const data = await api(`/api/videos/${state.video.id}/qc/rules`, { method: 'PUT', body });
+    state.qcRules = data.rules;
+    await loadQcReport();
+    renderQcPanel();
+    renderPublishCard();
+    toast('质检规则已保存；阈值变化后既有放行已全部失效（历史保留）');
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.current_rules) {
+      state.qcRules = err.data.current_rules;
+      renderQcPanel();
+      toast(`规则修订号过期：${err.message}`, true);
+      return;
+    }
+    msg.textContent = `保存失败：${err.message}`;
+    msg.className = 'error';
+  }
+}
+
+function renderQcReportHtml(rep) {
+  if (!rep.configured) {
+    return '<p class="meta">当前未配置任何质检阈值，质检不阻断发布。配置阈值后此处逐段列出实测值、阈值与违规项。</p>';
+  }
+  const blocking = rep.blocking_violations || [];
+  const rows = blocking.map((v) => `
+    <tr class="qc-bad">
+      <td>${v.segment_id}</td>
+      <td><a href="javascript:void(0)" class="qc-seek" data-id="${v.segment_id}">${fmtTime(v.start_ms)} → ${fmtTime(v.end_ms)}</a></td>
+      <td>${TRACK_NAMES[v.track]}${v.track === 'translation' && v.language ? `（${esc(v.language)}）` : ''}</td>
+      <td>${RULE_NAMES[v.rule]}</td>
+      <td class="mono">${esc(String(v.value))}</td>
+      <td class="mono">${esc(String(v.threshold))}</td>
+      <td><button class="btn small danger" data-act="qc-waive"
+         data-seg="${v.segment_id}" data-track="${v.track}" data-rule="${v.rule}">填写理由放行</button></td>
+    </tr>`).join('');
+
+  const waived = (rep.violations || []).filter((v) => v.waived);
+  const waivedRows = waived.map((v) => `
+    <tr class="qc-waived">
+      <td>${v.segment_id}</td>
+      <td><a href="javascript:void(0)" class="qc-seek" data-id="${v.segment_id}">${fmtTime(v.start_ms)} → ${fmtTime(v.end_ms)}</a></td>
+      <td>${TRACK_NAMES[v.track]}${v.track === 'translation' && v.language ? `（${esc(v.language)}）` : ''}</td>
+      <td>${RULE_NAMES[v.rule]}</td>
+      <td class="mono">${esc(String(v.value))} / ${esc(String(v.threshold))}</td>
+      <td>已放行：${esc(v.waiver ? v.waiver.reason : '')}</td>
+    </tr>`).join('');
+
+  const history = (rep.waivers || []).filter((w) => !w.active);
+  const historyRows = history.slice(0, 50).map((w) => `
+    <tr class="qc-hist">
+      <td>${w.segment_id}</td>
+      <td>${TRACK_NAMES[w.track]}${w.language ? `（${esc(w.language)}）` : ''}</td>
+      <td>${RULE_NAMES[w.rule]}</td>
+      <td class="qc-reason-cell">${esc(w.reason)}</td>
+      <td>${new Date(w.created_at).toLocaleString()}</td>
+      <td><span class="tag warn">已失效</span></td>
+    </tr>`).join('');
+
+  return `
+    <p class="meta">逐段质检结果：共 <b>${rep.violation_count}</b> 项违规，
+      其中 <b style="color:var(--danger)">${blocking.length} 项待放行</b>，
+      <span style="color:var(--ok)">${waived.length} 项已放行</span>；历史失效放行 ${history.length} 条（理由保留）。</p>
+    ${blocking.length ? `
+    <b class="bad">⚠️ 阻止发布的违规（逐项可放行）</b>
+    <div class="qc-scroll">
+      <table class="seg-table qc-table">
+        <thead><tr><th>#</th><th>时间（点击定位）</th><th>轨道</th><th>项目</th><th>实测值</th><th>阈值</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>` : '<p class="good">✔ 没有阻止发布的违规。</p>'}
+    ${waived.length ? `
+    <b style="color:var(--ok)">已放行（绑定内容/阈值变化后自动失效）</b>
+    <div class="qc-scroll">
+      <table class="seg-table qc-table">
+        <thead><tr><th>#</th><th>时间</th><th>轨道</th><th>项目</th><th>实测/阈值</th><th>理由</th></tr></thead>
+        <tbody>${waivedRows}</tbody>
+      </table>
+    </div>` : ''}
+    ${history.length ? `
+    <details><summary class="meta">失效放行历史（${history.length} 条）</summary>
+    <div class="qc-scroll">
+      <table class="seg-table qc-table">
+        <thead><tr><th>#</th><th>轨道</th><th>项目</th><th>理由</th><th>放行时间</th><th>状态</th></tr></thead>
+        <tbody>${historyRows}</tbody>
+      </table>
+    </div></details>` : ''}`;
+}
+
+function bindQcReportActions(card, rep) {
+  card.querySelectorAll('.qc-seek').forEach((a) => {
+    a.addEventListener('click', () => seekSegment(Number(a.dataset.id)));
+  });
+  card.querySelectorAll('[data-act=qc-waive]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const segId = Number(btn.dataset.seg);
+      const v = rep.violations.find((x) => x.segment_id === segId && x.track === btn.dataset.track && x.rule === btn.dataset.rule);
+      if (v) openQcWaiver(v);
+    });
+  });
+}
+
+function seekSegment(id) {
+  const seg = state.segments.find((s) => s.id === id);
+  if (!seg) return;
+  state.activeSegmentId = id;
+  const videoEl = currentVideoEl();
+  if (videoEl) videoEl.currentTime = seg.start_ms / 1000;
+  renderSegmentDependent();
+  const tr = document.querySelector(`#segTbody tr[data-id="${id}"]`);
+  if (tr) tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function openQcWaiver(v) {
+  qcWaiverEditor.segmentId = v.segment_id;
+  qcWaiverEditor.track = v.track;
+  qcWaiverEditor.rule = v.rule;
+  $('qcWaiverSegId').textContent = v.segment_id;
+  $('qcWaiverTrack').textContent = TRACK_NAMES[v.track] + (v.track === 'translation' && v.language ? `（${v.language}）` : '');
+  $('qcWaiverRule').textContent = RULE_NAMES[v.rule];
+  $('qcWaiverValue').textContent = v.value;
+  $('qcWaiverThreshold').textContent = v.threshold;
+  $('qcWaiverReason').value = '';
+  $('qcWaiverError').textContent = '';
+  $('qcWaiverModal').classList.remove('hidden');
+}
+function closeQcWaiver() {
+  qcWaiverEditor.segmentId = null;
+  $('qcWaiverModal').classList.add('hidden');
+}
+
+async function saveQcWaiver() {
+  const e = qcWaiverEditor;
+  if (!e.segmentId) return;
+  const reason = $('qcWaiverReason').value.trim();
+  if (!reason) { $('qcWaiverError').textContent = '请填写放行理由'; return; }
+  const seg = state.segments.find((s) => s.id === e.segmentId);
+  const body = { track: e.track, rule: e.rule, reason, segment_revision: seg ? seg.revision : null };
+  if (e.track === 'translation') {
+    const tr = trOf(e.segmentId);
+    if (tr) body.revision = tr.revision;
+  }
+  $('qcWaiverError').textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/${e.segmentId}/qc/waiver`, { method: 'PUT', body });
+    state.qcReport = data.qc;
+    closeQcWaiver();
+    renderQcPanel();
+    renderPublishCard();
+    toast('已放行：该违规不再阻止发布；内容或阈值变化后放行自动失效');
+  } catch (err) {
+    if (err.status === 409) {
+      await refreshCurrent();
+      closeQcWaiver();
+      toast(`冲突：${err.message}，已刷新当前状态`, true);
+      return;
+    }
+    if (err.status === 422 && err.data && err.data.current_qc) {
+      state.qcReport = err.data.current_qc;
+      renderQcPanel();
+      renderPublishCard();
+      $('qcWaiverError').textContent = `未能放行：${err.message}`;
+      return;
+    }
+    $('qcWaiverError').textContent = `未能放行：${err.message}`;
+  }
+}
+
+async function openPublishedQc(version, unavailable) {
+  if (unavailable) {
+    toast(`v${version} 发布时未配置质检阈值，没有质检快照（旧版本行为保持不变）`, true);
+    return;
+  }
+  try {
+    const d = await api(`/api/videos/${state.video.id}/publications/${version}/qc`);
+    $('qcPubTitle').textContent = `v${d.version} 发布时固定的质检快照（${new Date(d.published_at).toLocaleString()}）`;
+    $('qcPubMeta').textContent =
+      `规则修订号 ${d.rules_snapshot ? d.rules_snapshot.revision : 0}；检查轨道：${d.tracks.join('、')}；` +
+      `违规 ${d.violations.length} 项；有效放行 ${d.valid_waivers.length} 项（快照固定，不随后续编辑变化）。`;
+    const bodyRows = d.violations.map((v) => `
+      <tr class="${v.waived ? 'qc-waived' : 'qc-bad'}">
+        <td>${v.segment_id}</td>
+        <td class="mono">${fmtTime(v.start_ms)} → ${fmtTime(v.end_ms)}</td>
+        <td>${TRACK_NAMES[v.track]}${v.track === 'translation' && v.language ? `（${esc(v.language)}）` : ''}</td>
+        <td>${RULE_NAMES[v.rule]}</td>
+        <td class="mono">${esc(String(v.value))}</td>
+        <td class="mono">${esc(String(v.threshold))}</td>
+        <td>${v.waived ? `已放行：${esc(v.waiver ? v.waiver.reason : '')}` : '<span class="tag warn">未放行</span>'}</td>
+      </tr>`).join('');
+    $('qcPubBody').innerHTML = `
+      <table class="seg-table qc-table">
+        <thead><tr><th>#</th><th>时间</th><th>轨道</th><th>项目</th><th>实测值</th><th>阈值</th><th>发布时状态</th></tr></thead>
+        <tbody>${bodyRows || '<tr><td colspan="7" class="meta">该版本质检无违规项。</td></tr>'}</tbody>
+      </table>`;
+    $('qcPubModal').classList.remove('hidden');
+  } catch (err) {
+    toast(`无法查看：${err.message}`, true);
+  }
+}
+
 /* ================= 发布 / 下载 ================= */
 function computeStatus() {
   const problems = [];
@@ -763,11 +1074,17 @@ function computeStatus() {
     if (tr.stale) problems.push(`译文轨道：${tr.stale} 段译文已失效（需重新校对）`);
     if (tr.unreviewed) problems.push(`译文轨道：${tr.unreviewed} 段译文待审校`);
   }
+  // 质检门禁：未放行的违规阻止发布（已放行的不阻止）
+  const qc = state.qcReport;
+  if (qc && qc.configured && qc.blocking_count > 0) {
+    problems.push(`质检：${qc.blocking_count} 项违规尚未放行`);
+  }
   return {
     canPublish: problems.length === 0,
     problems,
     reviewedCount: state.segments.filter((s) => s.reviewed).length,
     tr,
+    qc,
   };
 }
 
@@ -786,6 +1103,7 @@ function renderPublishCard() {
       ${track ? `<li class="${status.tr.missing + status.tr.stale + status.tr.unreviewed === 0 && state.segments.length ? 'good' : 'bad'}">
         译文（${esc(state.translationLang)}）已审：${status.tr.ok}/${state.segments.length}
         ${status.tr.missing ? `｜未译 ${status.tr.missing}` : ''}${status.tr.stale ? `｜已失效 ${status.tr.stale}` : ''}${status.tr.unreviewed ? `｜待审 ${status.tr.unreviewed}` : ''}</li>` : ''}
+      ${renderQcStatusLi(status.qc)}
       ${status.problems.filter((p) => !p.includes('未通过审校') && !p.includes('至少需要') && !p.startsWith('译文轨道')).map((p) =>
         `<li class="bad">时间问题：${esc(p)}</li>`).join('')}
     </ul>
@@ -849,9 +1167,13 @@ function renderPublishCard() {
   const pubList = $('pubList');
   pubList.innerHTML = state.publications.length
     ? '历史发布：' + state.publications
-        .map((p) => `v${p.version}${p.has_translation ? '（双轨）' : ''} · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段`)
+        .map((p) => `v${p.version}${p.has_translation ? '（双轨）' : ''}${p.has_qc ? '（含质检快照）' : ''} · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段
+          <a href="javascript:void(0)" class="qc-pub-link" data-version="${p.version}">${p.has_qc ? '查看质检快照' : '质检快照（无）'}</a>`)
         .join(' ｜ ')
     : '尚未发布过版本';
+  pubList.querySelectorAll('.qc-pub-link').forEach((a) => {
+    a.addEventListener('click', () => openPublishedQc(Number(a.dataset.version), !state.publications.find((p) => p.version === Number(a.dataset.version)).has_qc));
+  });
 }
 
 async function publishVersion() {
@@ -862,6 +1184,15 @@ async function publishVersion() {
   } catch (err) {
     const pending = err.data && Array.isArray(err.data.pending) ? err.data.pending : [];
     const suffix = pending.length ? `（待处理片段：${pending.map((p) => `#${p.segment_id}`).join('、')}）` : '';
+    if (err.data && err.data.code === 'qc_blocked') {
+      // 发布时重新质检：刷新报告并展开质检面板定位未放行违规
+      try { await loadQcReport(); renderQcPanel(); renderPublishCard(); } catch (_) { /* 忽略 */ }
+      const n = err.data.qc && err.data.qc.blocking_count;
+      toast(`发布被质检阻止：${n} 项违规尚未放行，请在「质检规则与放行」中逐项处理`, true);
+      const card = $('qcCard');
+      if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
     toast(`发布失败：${err.message}${suffix}`, true);
   }
 }
@@ -1331,6 +1662,11 @@ $('shiftPreviewBtn').addEventListener('click', previewShift);
 $('shiftConfirmBtn').addEventListener('click', confirmShift);
 $('shiftOffset').addEventListener('input', invalidateShiftPreview);
 $('shiftModal').addEventListener('click', (e) => { if (e.target === $('shiftModal')) closeShiftModal(); });
+$('qcWaiverCancel').addEventListener('click', closeQcWaiver);
+$('qcWaiverSave').addEventListener('click', saveQcWaiver);
+$('qcWaiverModal').addEventListener('click', (e) => { if (e.target === $('qcWaiverModal')) closeQcWaiver(); });
+$('qcPubClose').addEventListener('click', () => $('qcPubModal').classList.add('hidden'));
+$('qcPubModal').addEventListener('click', (e) => { if (e.target === $('qcPubModal')) $('qcPubModal').classList.add('hidden'); });
 
 /* ================= 启动 ================= */
 loadList().catch((e) => {

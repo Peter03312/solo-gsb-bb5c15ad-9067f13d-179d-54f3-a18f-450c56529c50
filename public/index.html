@@ -210,6 +210,36 @@
 
   <div id="toast" class="toast hidden"></div>
 
+  <!-- 质检放行弹窗 -->
+  <div id="qcWaiverModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>填写放行理由</h3>
+      <p class="meta">片段 #<span id="qcWaiverSegId"></span> ｜ 轨道 <b id="qcWaiverTrack"></b> ｜ 项目 <b id="qcWaiverRule"></b>
+        ｜ 实测 <b id="qcWaiverValue"></b> ／ 阈值 <b id="qcWaiverThreshold"></b></p>
+      <p class="warn" id="qcWaiverBindNote">放行绑定该片段的时间、文本、轨道语言与当前阈值；任一变化后放行自动失效，但理由会保留在历史中。</p>
+      <label class="block">放行理由（必填，最多 500 字）
+        <textarea id="qcWaiverReason" rows="3" placeholder="例如：片头快语速，已人工逐字校对确认"></textarea>
+      </label>
+      <p id="qcWaiverError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="qcWaiverCancel">取消</button>
+        <button type="button" class="btn primary" id="qcWaiverSave">确认放行</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 已发布版本质检快照弹窗 -->
+  <div id="qcPubModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3 id="qcPubTitle">发布版本质检快照</h3>
+      <p class="meta" id="qcPubMeta"></p>
+      <div class="import-scroll" id="qcPubBody"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn primary" id="qcPubClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>
